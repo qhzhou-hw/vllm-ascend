@@ -30,13 +30,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path)
     parser.add_argument("--datasets", nargs="+", default=list(DEFAULT_DATASETS))
     parser.add_argument("--seed", type=int, default=20260823)
+    parser.add_argument("--samples-per-dataset", type=int, default=1)
     parser.add_argument("--min-input-tokens", type=int, default=1000)
     parser.add_argument("--max-input-tokens", type=int, default=5000)
     parser.add_argument("--max-model-len", type=int, default=8192)
     parser.add_argument("--tensor-parallel-size", type=int, default=2)
     parser.add_argument("--chunk-size", type=int, default=512)
     parser.add_argument("--seam-sink-tokens", type=int, default=8)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.samples_per_dataset <= 0:
+        parser.error("--samples-per-dataset must be positive")
+    return args
 
 
 def load_json(path: Path) -> Any:
@@ -82,18 +86,18 @@ def choose_samples(args: argparse.Namespace) -> list[dict[str, Any]]:
             for item in references
             if args.min_input_tokens <= int(item.get("input_tokens") or 0) <= args.max_input_tokens
         ]
-        if not eligible:
+        if len(eligible) < args.samples_per_dataset:
             raise ValueError(f"no eligible reference rows for {dataset}")
-        reference = rng.choice(eligible)
         rows = load_jsonl(args.data_dir / f"{dataset}.jsonl")
-        selected.append(
-            {
-                "dataset": dataset,
-                "index": int(reference["index"]),
-                "row": rows[int(reference["index"])],
-                "reference": reference,
-            }
-        )
+        for reference in rng.sample(eligible, args.samples_per_dataset):
+            selected.append(
+                {
+                    "dataset": dataset,
+                    "index": int(reference["index"]),
+                    "row": rows[int(reference["index"])],
+                    "reference": reference,
+                }
+            )
     return selected
 
 
