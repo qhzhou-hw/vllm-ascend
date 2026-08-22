@@ -32,6 +32,26 @@
 # =================
 # Entries are listed in alphabetical order by file name.
 #
+# ** File: platform/patch_hypic.py and worker/patch_hypic.py **
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#   1. vLLM V1 Scheduler, KVCacheManager, NewRequestData
+#   2. Ascend V1 model runner, full attention, and GDN operators
+#    Why:
+#       HYPIC reuses position-independent prompt segments in Qwen3.5 hybrid
+#       full-attention/GDN models. Upstream prefix caching only reuses a chained
+#       prefix and cannot express independent segment hits, RoPE re-rotation,
+#       seam recomputation, or affine recurrent-state composition.
+#    How:
+#       Opt in with additional_config.hypic_config. The scheduler builds a
+#       fixed-size sparse recompute plan; the worker caches public per-layer
+#       segment tensors, re-rotates full-attention keys, uses right-down causal
+#       attention, and composes GDN states as H_next = H_previous @ T + S.
+#    Related PR (if no, explain why):
+#       No. This is an experimental algorithm port from the HYPIC project.
+#    Future Plan:
+#       Replace monkey patches with upstream scheduler/operator extension
+#       interfaces when independent segment-cache APIs become available.
+#
 # ** 1. File: platform/patch_balance_schedule.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm.v1.engine.core.EngineCoreProc.run_engine_core`

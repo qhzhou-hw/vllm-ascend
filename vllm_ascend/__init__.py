@@ -30,12 +30,19 @@ _triton_available = importlib.util.find_spec("triton") is not None
 if os.getenv("VLLM_VERSION", "") != "0.26.0":
     from types import ModuleType
 
-    for _gluon_stub in (
-        "triton.experimental.gluon",
-        "triton.experimental.gluon.language",
-    ):
-        if _gluon_stub not in sys.modules:
-            sys.modules[_gluon_stub] = ModuleType(_gluon_stub)
+    # Python requires every parent package to exist during ``from
+    # triton.experimental import gluon``. Older code only registered the two
+    # leaf modules, so the import still failed with triton-ascend 3.2.x.
+    _experimental_name = "triton.experimental"
+    _gluon_name = f"{_experimental_name}.gluon"
+    _language_name = f"{_gluon_name}.language"
+    _experimental = sys.modules.setdefault(
+        _experimental_name, ModuleType(_experimental_name)
+    )
+    _gluon = sys.modules.setdefault(_gluon_name, ModuleType(_gluon_name))
+    _language = sys.modules.setdefault(_language_name, ModuleType(_language_name))
+    _experimental.gluon = _gluon
+    _gluon.language = _language
 
     # main2main compat: `_aggregate` was added to triton.language.core in
     # vllm main post-0.26.0. Stub it here so vllm.triton_utils can import it
