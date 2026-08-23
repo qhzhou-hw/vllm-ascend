@@ -6,6 +6,10 @@ and recurrent Gated DeltaNet state, while recomputing a small seam around the
 segment boundary. The feature is opt-in and currently targets Qwen3.5 hybrid
 attention models on Ascend 910B.
 
+For implementation details and reproducible accuracy evaluation, see the
+[Chinese porting guide](../../developer_guide/hypic_ascend_porting_zh.md) and
+[LongBench-E guide](../../developer_guide/evaluation/hypic_longbench_zh.md).
+
 ## Prerequisites
 
 HYPIC's Gated DeltaNet path uses the Ascend chunk kernel distributed by

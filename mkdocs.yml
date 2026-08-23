@@ -277,6 +277,7 @@ nav:
         - user_guide/feature_guide/pipeline_parallel.md
         - user_guide/feature_guide/dynamic_chunk_pipeline_parallel.md
         - user_guide/feature_guide/flash_attention.md
+        - user_guide/feature_guide/hypic.md
         - user_guide/feature_guide/short_request_first.md
         - user_guide/feature_guide/batch_job_aware_scheduler.md
     - Deployment Guide:
@@ -310,12 +311,14 @@ nav:
         - developer_guide/Design_Documents/dynamic_chunked_pipeline_parallel.md
         - developer_guide/Design_Documents/quantization.md
         - developer_guide/Design_Documents/npugraph_ex.md
+        - developer_guide/hypic_ascend_porting_zh.md
     - Evaluation:
         - developer_guide/evaluation/index.md
         - developer_guide/evaluation/using_evalscope.md
         - developer_guide/evaluation/using_lm_eval.md
         - developer_guide/evaluation/using_ais_bench.md
         - developer_guide/evaluation/using_opencompass.md
+        - developer_guide/evaluation/hypic_longbench_zh.md
     - Performance and Debug:
         - developer_guide/performance_and_debug/index.md
         - developer_guide/performance_and_debug/performance_benchmark.md

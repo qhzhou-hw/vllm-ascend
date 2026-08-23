@@ -15,12 +15,15 @@ This section is for developers who want to contribute to vLLM Ascend or understa
 
 Explore the design documents covering patch architecture, CPU binding, model runner internals, disaggregated prefill, EPLB, ACL Graph, KV Cache Pool, custom operators, context parallel, quantization, and NPUGraph.
 
+- **[HYPIC Ascend 适配说明](hypic_ascend_porting_zh.md)** — HYPIC 在 vLLM Ascend 上的架构、迁移步骤、验证方法和注意事项
+
 ## Evaluation
 
 - **[Using EvalScope](evaluation/using_evalscope.md)** — Model evaluation with EvalScope
 - **[Using lm_eval](evaluation/using_lm_eval.md)** — Model evaluation with lm_eval
 - **[Using AISBench](evaluation/using_ais_bench.md)** — Model evaluation with AISBench
 - **[Using OpenCompass](evaluation/using_opencompass.md)** — Model evaluation with OpenCompass
+- **[HYPIC LongBench-E 测试指南](evaluation/hypic_longbench_zh.md)** — Full Recompute、HYPIC-512/1024 准确率测试和 SGLang 对比
 
 ## Performance and Debug
 
