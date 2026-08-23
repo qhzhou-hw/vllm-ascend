@@ -27,6 +27,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config-dir", type=Path, required=True)
     parser.add_argument("--reference-dir", type=Path, required=True)
     parser.add_argument("--reference-prefix", default="hypic_512")
+    parser.add_argument("--mode", choices=("full_recompute", "hypic"), default="hypic")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--datasets", nargs="+", default=list(DEFAULT_DATASETS))
     parser.add_argument("--seed", type=int, default=20260823)
@@ -34,9 +35,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-input-tokens", type=int, default=1000)
     parser.add_argument("--max-input-tokens", type=int, default=5000)
     parser.add_argument("--max-model-len", type=int, default=8192)
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.85)
     parser.add_argument("--tensor-parallel-size", type=int, default=2)
     parser.add_argument("--chunk-size", type=int, default=512)
     parser.add_argument("--seam-sink-tokens", type=int, default=8)
+    parser.add_argument("--max-cache-segments", type=int, default=128)
     args = parser.parse_args()
     if args.samples_per_dataset <= 0:
         parser.error("--samples-per-dataset must be positive")
@@ -81,11 +84,14 @@ def choose_samples(args: argparse.Namespace) -> list[dict[str, Any]]:
     selected = []
     for dataset in args.datasets:
         references = load_jsonl(args.reference_dir / f"{args.reference_prefix}.{dataset}.jsonl")
-        eligible = [
-            item
-            for item in references
-            if args.min_input_tokens <= int(item.get("input_tokens") or 0) <= args.max_input_tokens
-        ]
+        eligible = sorted(
+            (
+                item
+                for item in references
+                if args.min_input_tokens <= int(item.get("input_tokens") or 0) <= args.max_input_tokens
+            ),
+            key=lambda item: int(item["index"]),
+        )
         if len(eligible) < args.samples_per_dataset:
             raise ValueError(f"no eligible reference rows for {dataset}")
         rows = load_jsonl(args.data_dir / f"{dataset}.jsonl")
@@ -109,22 +115,27 @@ def main() -> None:
     selected = choose_samples(args)
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
 
-    engine = LLM(
+    engine_args: dict[str, Any] = dict(
         model=args.model,
         tensor_parallel_size=args.tensor_parallel_size,
         enforce_eager=True,
         max_num_seqs=1,
         max_model_len=args.max_model_len,
         max_num_batched_tokens=args.max_model_len,
-        gpu_memory_utilization=0.90,
-        additional_config={
+        gpu_memory_utilization=args.gpu_memory_utilization,
+    )
+    if args.mode == "hypic":
+        engine_args["additional_config"] = {
             "hypic_config": {
                 "enabled": True,
                 "chunk_size": args.chunk_size,
                 "seam_sink_tokens": args.seam_sink_tokens,
+                "max_cache_segments": args.max_cache_segments,
             }
-        },
-    )
+        }
+    else:
+        engine_args["enable_prefix_caching"] = False
+    engine = LLM(**engine_args)
 
     results = []
     for item in selected:
@@ -142,13 +153,14 @@ def main() -> None:
             max_tokens=int(max_lens[dataset]),
         )
         generated = []
-        for _ in range(2):
+        num_runs = 2 if args.mode == "hypic" else 1
+        for _ in range(num_runs):
             output = engine.generate([prompt], params, use_tqdm=False)[0].outputs[0]
             generated.append({"pred": output.text.strip(), "output_ids": list(output.token_ids)})
 
         reference = item["reference"]
         cold_score = score(metrics[dataset], generated[0]["pred"], row)
-        warm_score = score(metrics[dataset], generated[1]["pred"], row)
+        warm_score = score(metrics[dataset], generated[-1]["pred"], row)
         result = {
             "dataset": dataset,
             "index": item["index"],
@@ -157,13 +169,13 @@ def main() -> None:
             "sglang_score": reference["score"],
             "vllm_cold_pred": generated[0]["pred"],
             "vllm_cold_score": cold_score,
-            "vllm_warm_pred": generated[1]["pred"],
+            "vllm_warm_pred": generated[-1]["pred"],
             "vllm_warm_score": warm_score,
-            "cold_warm_token_match": (generated[0]["output_ids"] == generated[1]["output_ids"]),
+            "cold_warm_token_match": (generated[0]["output_ids"] == generated[-1]["output_ids"]),
             "sglang_vllm_text_match": reference["pred"] == generated[0]["pred"],
             "score_delta": cold_score - float(reference["score"]),
             "cold_output_ids": generated[0]["output_ids"],
-            "warm_output_ids": generated[1]["output_ids"],
+            "warm_output_ids": generated[-1]["output_ids"],
         }
         results.append(result)
         print(
