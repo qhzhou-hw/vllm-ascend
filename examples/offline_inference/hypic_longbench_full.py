@@ -29,6 +29,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--max-model-len", type=int, default=45056)
     parser.add_argument("--tensor-parallel-size", type=int, default=2)
+    parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.85)
     parser.add_argument("--seam-sink-tokens", type=int, default=8)
     parser.add_argument("--max-cache-segments", type=int, default=128)
@@ -37,6 +38,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--chunk-size must be positive in hypic mode")
     if args.mode == "full_recompute" and args.chunk_size != 0:
         parser.error("--chunk-size must be 0 in full_recompute mode")
+    if args.batch_size <= 0:
+        parser.error("--batch-size must be positive")
+    if args.mode == "hypic" and args.batch_size != 1:
+        parser.error("HYPIC currently requires --batch-size 1")
     return args
 
 
@@ -109,7 +114,7 @@ def main() -> None:
         model=args.model,
         tensor_parallel_size=args.tensor_parallel_size,
         enforce_eager=True,
-        max_num_seqs=1,
+        max_num_seqs=args.batch_size,
         max_model_len=args.max_model_len,
         max_num_batched_tokens=args.max_model_len,
         gpu_memory_utilization=args.gpu_memory_utilization,
@@ -139,54 +144,72 @@ def main() -> None:
             flush=True,
         )
         with output_path.open("a", encoding="utf-8") as output_file:
-            for index, row in enumerate(rows):
-                if index in completed:
-                    continue
-                formatted = prompts[dataset].format(context=row["context"], input=row.get("input", ""))
-                prompt = tokenizer.apply_chat_template(
-                    [{"role": "user", "content": formatted}],
-                    tokenize=False,
-                    add_generation_prompt=True,
-                    enable_thinking=False,
-                )
-                input_tokens = len(tokenizer.encode(prompt, add_special_tokens=False))
+            pending = [(index, row) for index, row in enumerate(rows) if index not in completed]
+            for batch_start in range(0, len(pending), args.batch_size):
+                batch = pending[batch_start : batch_start + args.batch_size]
+                prepared = []
+                for index, row in batch:
+                    formatted = prompts[dataset].format(
+                        context=row["context"],
+                        input=row.get("input", ""),
+                    )
+                    prompt = tokenizer.apply_chat_template(
+                        [{"role": "user", "content": formatted}],
+                        tokenize=False,
+                        add_generation_prompt=True,
+                        enable_thinking=False,
+                    )
+                    prepared.append(
+                        (
+                            index,
+                            row,
+                            prompt,
+                            len(tokenizer.encode(prompt, add_special_tokens=False)),
+                        )
+                    )
                 started = time.perf_counter()
-                request_output = engine.generate(
-                    [prompt],
+                request_outputs = engine.generate(
+                    [item[2] for item in prepared],
                     SamplingParams(temperature=0.0, max_tokens=int(max_lens[dataset])),
                     use_tqdm=False,
-                )[0]
-                generation = request_output.outputs[0]
-                prediction = generation.text.strip()
-                item = {
-                    "dataset": dataset,
-                    "index": index,
-                    "pred": prediction,
-                    "answers": row["answers"],
-                    "all_classes": row.get("all_classes", []),
-                    "length": row.get("length"),
-                    "score": score(metrics[dataset], prediction, row),
-                    "input_tokens": input_tokens,
-                    "segments": (
-                        (input_tokens + args.chunk_size - 1) // args.chunk_size if args.mode == "hypic" else 1
-                    ),
-                    "output_ids": list(generation.token_ids),
-                    "cached_tokens": 0,
-                    "prompt_tokens": input_tokens,
-                    "completion_tokens": len(generation.token_ids),
-                    "latency": time.perf_counter() - started,
-                    "finish_reason": generation.finish_reason,
-                }
-                output_file.write(json.dumps(item, ensure_ascii=False) + "\n")
-                output_file.flush()
-                os.fsync(output_file.fileno())
-                completed[index] = item
-                print(
-                    f"SAMPLE run={run_name} dataset={dataset} "
-                    f"{index + 1}/{len(rows)} score={100 * item['score']:.2f} "
-                    f"tokens={input_tokens} latency={item['latency']:.2f}s",
-                    flush=True,
                 )
+                batch_latency = time.perf_counter() - started
+                for (index, row, _, input_tokens), request_output in zip(
+                    prepared,
+                    request_outputs,
+                    strict=True,
+                ):
+                    generation = request_output.outputs[0]
+                    prediction = generation.text.strip()
+                    item = {
+                        "dataset": dataset,
+                        "index": index,
+                        "pred": prediction,
+                        "answers": row["answers"],
+                        "all_classes": row.get("all_classes", []),
+                        "length": row.get("length"),
+                        "score": score(metrics[dataset], prediction, row),
+                        "input_tokens": input_tokens,
+                        "segments": (
+                            (input_tokens + args.chunk_size - 1) // args.chunk_size if args.mode == "hypic" else 1
+                        ),
+                        "output_ids": list(generation.token_ids),
+                        "cached_tokens": 0,
+                        "prompt_tokens": input_tokens,
+                        "completion_tokens": len(generation.token_ids),
+                        "latency": batch_latency,
+                        "finish_reason": generation.finish_reason,
+                    }
+                    output_file.write(json.dumps(item, ensure_ascii=False) + "\n")
+                    output_file.flush()
+                    os.fsync(output_file.fileno())
+                    completed[index] = item
+                    print(
+                        f"SAMPLE run={run_name} dataset={dataset} "
+                        f"{index + 1}/{len(rows)} score={100 * item['score']:.2f} "
+                        f"tokens={input_tokens} batch_latency={batch_latency:.2f}s",
+                        flush=True,
+                    )
 
         ordered = [completed[index] for index in range(len(rows))]
         dataset_summaries[dataset] = summarize(ordered)
