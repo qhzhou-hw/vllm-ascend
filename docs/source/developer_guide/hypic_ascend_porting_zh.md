@@ -316,4 +316,3 @@ HYPIC 模式内部保留 vLLM prefix caching 配置以通过 hybrid-cache 校验
 - [ ] 最终 conv/recurrent state 写入 decode slot。
 - [ ] scheduler 和 device LRU 不发生 divergence。
 - [ ] 真实 NPU 上完成 cold/warm、四数据集采样和 LongBench-E。
-
