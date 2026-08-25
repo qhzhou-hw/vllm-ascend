@@ -16,19 +16,47 @@ def segment_hash(token_ids: Sequence[int]) -> str:
     return hashlib.sha256(payload).digest()[:16].hex()
 
 
-def split_segments(num_tokens: int, chunk_size: int) -> list[tuple[int, int]]:
-    """Split a token sequence into fixed-size, non-empty half-open ranges."""
+def split_segments(
+    num_tokens: int,
+    chunk_size: int,
+    boundaries: Sequence[int] | None = None,
+) -> list[tuple[int, int]]:
+    """Split tokens without crossing optional semantic boundaries.
+
+    ``chunk_size`` remains the maximum device-slot length. Explicit boundaries
+    are hard cuts, so a tool schema can be cached independently even when tools
+    are reordered between requests. Regions longer than ``chunk_size`` are
+    split further without being merged with a neighboring semantic region.
+    """
     if num_tokens < 0:
         raise ValueError("num_tokens cannot be negative")
     if chunk_size <= 0:
         raise ValueError("chunk_size must be positive")
-    return [(start, min(start + chunk_size, num_tokens)) for start in range(0, num_tokens, chunk_size)]
+    if boundaries is None:
+        anchors = [0, num_tokens]
+    else:
+        anchors = [int(position) for position in boundaries]
+        if anchors != sorted(set(anchors)):
+            raise ValueError("HYPIC segment boundaries must be sorted and unique")
+        if anchors and (anchors[0] < 0 or anchors[-1] > num_tokens):
+            raise ValueError("HYPIC segment boundary is outside the prompt")
+        if not anchors or anchors[0] != 0:
+            anchors.insert(0, 0)
+        if anchors[-1] != num_tokens:
+            anchors.append(num_tokens)
+
+    ranges: list[tuple[int, int]] = []
+    for region_start, region_end in zip(anchors, anchors[1:]):
+        for start in range(region_start, region_end, chunk_size):
+            ranges.append((start, min(start + chunk_size, region_end)))
+    return ranges
 
 
 def build_plan(
     token_ids: Sequence[int],
     ready_segments: dict[str, tuple[int, ...]],
     config: HypicConfig,
+    segment_boundaries: Sequence[int] | None = None,
 ) -> dict[str, Any]:
     """Build a process-safe sparse prefill plan for one request.
 
@@ -37,7 +65,9 @@ def build_plan(
     segment start so boundary behavior matches the SGLang implementation.
     """
     tokens = [int(token) for token in token_ids]
-    ranges = split_segments(len(tokens), config.chunk_size)
+    ranges = split_segments(
+        len(tokens), config.chunk_size, boundaries=segment_boundaries
+    )
     query_positions: list[int] = []
     segments: list[dict[str, Any]] = []
 

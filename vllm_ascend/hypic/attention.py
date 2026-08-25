@@ -7,7 +7,6 @@ import math
 import torch
 
 from vllm_ascend.device.device_op import DeviceOperator
-from vllm_ascend.hypic.cache import LayerSegmentState
 from vllm_ascend.hypic.runtime import HypicBatchContext
 
 
@@ -156,6 +155,7 @@ def _hydrate_paged_kv_cache(
     value: torch.Tensor,
     *,
     start: int,
+    request_index: int,
     kv_cache: tuple[torch.Tensor, ...],
     attn_metadata: object,
 ) -> None:
@@ -163,13 +163,17 @@ def _hydrate_paged_kv_cache(
     if len(kv_cache) < 2:
         raise RuntimeError("HYPIC requires a writable paged KV cache")
     block_tables = getattr(attn_metadata, "block_tables", None)
-    if block_tables is None or block_tables.shape[0] != 1:
-        raise RuntimeError("HYPIC expected exactly one paged-cache block table")
+    if block_tables is None or request_index >= block_tables.shape[0]:
+        raise RuntimeError(
+            f"HYPIC paged-cache block table is missing request {request_index}"
+        )
 
     block_size = int(kv_cache[0].shape[1])
     positions = torch.arange(start, start + key.shape[0], device=key.device)
     logical_blocks = torch.div(positions, block_size, rounding_mode="floor")
-    physical_blocks = block_tables[0].index_select(0, logical_blocks.to(block_tables.device, torch.long))
+    physical_blocks = block_tables[request_index].index_select(
+        0, logical_blocks.to(block_tables.device, torch.long)
+    )
     slots = physical_blocks.to(torch.long) * block_size + positions.remainder(block_size)
     if bool((slots < 0).any().item()):
         raise RuntimeError("HYPIC paged-cache block table contains an unallocated block")
@@ -199,10 +203,14 @@ def forward_hypic_attention(
     rotary_emb = getattr(layer, "hypic_rotary_emb", None)
     if rotary_emb is None:
         raise RuntimeError(f"HYPIC RoPE metadata is missing for {layer_name}")
+    key_pool = getattr(layer, "hypic_key_pool", None)
+    value_pool = getattr(layer, "hypic_value_pool", None)
+    if key_pool is None or value_pool is None:
+        raise RuntimeError(f"HYPIC static attention pool is missing for {layer_name}")
 
     packed_offset = 0
     output_offset = 0
-    for request_id in context.request_ids:
+    for request_index, request_id in enumerate(context.request_ids):
         plan = context.plans.get(request_id)
         if plan is None:
             continue
@@ -218,15 +226,17 @@ def forward_hypic_attention(
             current_value = value[packed_offset : packed_offset + query_len]
 
             if hit:
-                cached = context.cache.get(segment["hash"], layer_name)
-                if cached is None or cached.key is None or cached.value is None:
+                slot = context.cache.lookup(segment["hash"])
+                if slot is None:
                     raise RuntimeError(
                         f"HYPIC scheduler/worker cache divergence for segment {segment['hash']} at {layer_name}"
                     )
+                cached_key = key_pool[slot, :length]
+                cached_value = value_pool[slot, :length]
                 local_positions = torch.arange(length, device=key.device)
                 absolute_positions = local_positions + start
-                segment_key = rerotate_keys(cached.key, local_positions, absolute_positions, rotary_emb)
-                segment_value = cached.value
+                segment_key = rerotate_keys(cached_key, local_positions, absolute_positions, rotary_emb)
+                segment_value = cached_value
                 if query_len:
                     segment_key = segment_key.clone()
                     segment_value = segment_value.clone()
@@ -245,6 +255,7 @@ def forward_hypic_attention(
                     segment_key,
                     segment_value,
                     start=start,
+                    request_index=request_index,
                     kv_cache=kv_cache,
                     attn_metadata=attn_metadata,
                 )
@@ -262,14 +273,14 @@ def forward_hypic_attention(
                         local_positions,
                         rotary_emb,
                     )
-                    context.cache.put(
-                        segment["hash"],
-                        layer_name,
-                        LayerSegmentState(
-                            key=public_key.detach().clone(),
-                            value=segment_value.detach().clone(),
-                        ),
-                    )
+                    slot = context.cache.lookup(segment["hash"])
+                    if slot is None:
+                        raise RuntimeError(
+                            "HYPIC static slot was not prepared for segment "
+                            f"{segment['hash']} at {layer_name}"
+                        )
+                    key_pool[slot, :length].copy_(public_key)
+                    value_pool[slot, :length].copy_(segment_value)
 
             if query_len:
                 segment_query = query[packed_offset : packed_offset + query_len]

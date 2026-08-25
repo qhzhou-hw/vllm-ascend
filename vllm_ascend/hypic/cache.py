@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import heapq
 from collections import OrderedDict
 from collections.abc import Iterable
-from dataclasses import dataclass, field
 from typing import Any
 
 
@@ -38,51 +38,82 @@ class SegmentCatalog:
         return evicted
 
 
-@dataclass
-class LayerSegmentState:
-    """One layer's public HYPIC state for a prompt segment."""
-
-    key: Any | None = None
-    value: Any | None = None
-    conv_tail: Any | None = None
-    zero_state: Any | None = None
-    transition: Any | None = None
-    metadata: dict[str, Any] = field(default_factory=dict)
-
-
 class DeviceSegmentCache:
-    """Worker-side per-layer tensor cache with deterministic segment LRU."""
+    """Worker-side deterministic mapping from segment hashes to pool slots.
+
+    Layer tensors live in fixed-size buffers allocated with the model. Cache
+    entries contain only slot ids, matching SGLang PICache's ownership model and
+    keeping runtime segment growth out of the dynamic NPU allocator.
+    """
 
     def __init__(self, max_segments: int) -> None:
         if max_segments <= 0:
             raise ValueError("max_segments must be positive")
         self.max_segments = max_segments
-        self.segments: OrderedDict[str, dict[str, LayerSegmentState]] = OrderedDict()
+        self.segments: OrderedDict[str, int] = OrderedDict()
+        self._free_slots = list(range(max_segments))
+        heapq.heapify(self._free_slots)
 
-    def get(self, digest: str, layer_name: str) -> LayerSegmentState | None:
-        """Return cached layer state and refresh the segment's LRU position."""
-        layers = self.segments.get(digest)
-        if layers is None:
-            return None
-        self.segments.move_to_end(digest)
-        return layers.get(layer_name)
+    def lookup(self, digest: str) -> int | None:
+        """Return a resident slot without changing the forward's LRU state."""
+        return self.segments.get(digest)
 
-    def put(
-        self,
-        digest: str,
-        layer_name: str,
-        state: LayerSegmentState,
-    ) -> list[str]:
-        """Store layer state and evict complete least-recently-used segments."""
-        self.segments.setdefault(digest, {})[layer_name] = state
-        self.segments.move_to_end(digest)
-        evicted: list[str] = []
-        while len(self.segments) > self.max_segments:
-            old_digest, _ = self.segments.popitem(last=False)
-            evicted.append(old_digest)
-        return evicted
+    def touch(self, digest: str) -> int | None:
+        """Return a resident slot and refresh its scheduler-matching LRU."""
+        slot = self.segments.get(digest)
+        if slot is not None:
+            self.segments.move_to_end(digest)
+        return slot
+
+    def reserve(self, digest: str) -> int:
+        """Return a stable slot, reusing the least-recently-used slot if full."""
+        existing = self.touch(digest)
+        if existing is not None:
+            return existing
+        if self._free_slots:
+            slot = heapq.heappop(self._free_slots)
+        else:
+            _, slot = self.segments.popitem(last=False)
+        self.segments[digest] = slot
+        return slot
+
+    def prepare(self, plans: Iterable[dict[str, Any]]) -> None:
+        """Pin every cacheable segment used by one packed model forward.
+
+        Slot assignment happens before the first layer executes. This keeps a
+        miss in an early layer from evicting a hit that a later layer still has
+        to read. The scheduler's token budget bounds the number of active
+        cacheable segments, so they must all fit in the static pool.
+        """
+        active: set[str] = set()
+        misses: list[str] = []
+        seen_misses: set[str] = set()
+        for plan in plans:
+            for segment in plan["segments"]:
+                if not segment["cacheable"]:
+                    continue
+                digest = str(segment["hash"])
+                active.add(digest)
+                if segment["hit"] and self.touch(digest) is None:
+                    raise RuntimeError(
+                        "HYPIC scheduler/worker cache divergence for "
+                        f"segment {digest}"
+                    )
+                if not segment["hit"] and digest not in seen_misses:
+                    misses.append(digest)
+                    seen_misses.add(digest)
+        if len(active) > self.max_segments:
+            raise RuntimeError(
+                "HYPIC packed prefill needs "
+                f"{len(active)} cache slots, but only {self.max_segments} "
+                "were configured"
+            )
+        for digest in misses:
+            self.reserve(digest)
 
     def discard(self, digests: Iterable[str]) -> None:
-        """Discard scheduler-evicted segments if an eviction list is supplied."""
+        """Discard scheduler-evicted entries and return their slots to the pool."""
         for digest in digests:
-            self.segments.pop(digest, None)
+            slot = self.segments.pop(digest, None)
+            if slot is not None:
+                heapq.heappush(self._free_slots, slot)

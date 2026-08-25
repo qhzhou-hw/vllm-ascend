@@ -13,7 +13,9 @@ class HypicConfig:
     enabled: bool = False
     chunk_size: int = 512
     seam_sink_tokens: int = 8
-    max_cache_segments: int = 128
+    # Segment tensors use fixed model-owned pools, so vLLM accounts for their
+    # memory before sizing the ordinary hybrid KV cache.
+    max_cache_segments: int = 96
     mode: str = "transition_rope_recompute"
 
     @classmethod

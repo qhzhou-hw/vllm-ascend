@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_manager import KVCacheManager
+from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.core.sched.scheduler import Scheduler
 
@@ -19,6 +21,7 @@ logger = init_logger(__name__)
 
 _ORIGINAL_CHECK_CONFIG = NPUPlatform.check_and_update_config.__func__
 _ORIGINAL_SCHEDULER_INIT = Scheduler.__init__
+_ORIGINAL_SCHEDULE = Scheduler.schedule
 _ORIGINAL_MAMBA_SPLIT = Scheduler._mamba_block_aligned_split
 _ORIGINAL_GET_COMPUTED_BLOCKS = KVCacheManager.get_computed_blocks
 _ORIGINAL_NEW_REQUEST = NewRequestData.from_request.__func__
@@ -59,9 +62,22 @@ def _check_and_update_config(cls: type, vllm_config: Any) -> None:
         if vllm_config.kv_transfer_config is not None:
             raise ValueError("HYPIC does not support KV transfer/disaggregation")
 
+        max_batched_tokens = int(
+            vllm_config.scheduler_config.max_num_batched_tokens
+        )
+        required_slots = max(
+            1, math.ceil(max_batched_tokens / config.chunk_size) - 1
+        )
+        if config.max_cache_segments < required_slots:
+            raise ValueError(
+                "hypic_config.max_cache_segments must be at least "
+                f"{required_slots} for max_num_batched_tokens="
+                f"{max_batched_tokens} and chunk_size={config.chunk_size}; "
+                "all cacheable segments in one packed forward need stable slots"
+            )
+
         model_config.enforce_eager = True
         vllm_config.scheduler_config.enable_chunked_prefill = False
-        vllm_config.scheduler_config.max_num_seqs = 1
         # Hybrid models otherwise retain a 2048-token scheduling cap even when
         # max_num_batched_tokens is larger. HYPIC must plan and execute a whole
         # prompt atomically because its query positions are non-contiguous.
@@ -84,6 +100,27 @@ def _scheduler_init(self: Scheduler, *args: Any, **kwargs: Any) -> None:
         self.hypic_config = config
         self.hypic_catalog = SegmentCatalog(config.max_cache_segments)
         self.kv_cache_manager.hypic_scheduler = self
+
+
+def _schedule(self: Scheduler, *args: Any, **kwargs: Any) -> Any:
+    """Keep HYPIC prefills isolated from in-flight decode requests.
+
+    Multiple waiting requests may still be admitted together when the running
+    set is empty. Once admitted, that request group drains before the scheduler
+    admits another HYPIC prefill group. This preserves ordinary batched decode
+    while avoiding a mixed custom-prefill/standard-decode model forward.
+    """
+    if (
+        hasattr(self, "hypic_catalog")
+        and self.running
+        and self._pause_state == PauseState.UNPAUSED
+    ):
+        self._pause_state = PauseState.PAUSED_NEW
+        try:
+            return _ORIGINAL_SCHEDULE(self, *args, **kwargs)
+        finally:
+            self._pause_state = PauseState.UNPAUSED
+    return _ORIGINAL_SCHEDULE(self, *args, **kwargs)
 
 
 def _mamba_block_aligned_split(
@@ -112,10 +149,17 @@ def _get_computed_blocks(self: KVCacheManager, request: Any) -> tuple[Any, int, 
         raise ValueError("HYPIC requires token-id prompts")
     if request.sampling_params is not None and getattr(request.sampling_params, "prompt_logprobs", None) is not None:
         raise ValueError("HYPIC does not support prompt logprobs")
+    extra_args = (
+        getattr(request.sampling_params, "extra_args", None)
+        if request.sampling_params is not None
+        else None
+    ) or {}
+    segment_boundaries = extra_args.get("hypic_segment_boundaries")
     plan = build_plan(
         request.prompt_token_ids,
         scheduler.hypic_catalog.ready,
         scheduler.hypic_config,
+        segment_boundaries=segment_boundaries,
     )
     scheduler.hypic_catalog.touch_plan(plan)
     request.hypic_plan = plan
@@ -151,6 +195,7 @@ def _update_from_output(self: Scheduler, scheduler_output: Any, model_runner_out
 
 NPUPlatform.check_and_update_config = classmethod(_check_and_update_config)
 Scheduler.__init__ = _scheduler_init
+Scheduler.schedule = _schedule
 Scheduler._mamba_block_aligned_split = _mamba_block_aligned_split
 KVCacheManager.get_computed_blocks = _get_computed_blocks
 NewRequestData.from_request = classmethod(_new_request_from_request)

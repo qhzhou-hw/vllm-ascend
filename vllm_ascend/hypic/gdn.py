@@ -13,7 +13,6 @@ except ImportError:  # Optional until HYPIC is enabled.
     chunk_gated_delta_rule_npu = None
 
 from vllm_ascend.device.device_op import DeviceOperator
-from vllm_ascend.hypic.cache import LayerSegmentState
 from vllm_ascend.hypic.runtime import HypicBatchContext
 
 
@@ -29,7 +28,7 @@ def _causal_conv(layer: Any, raw: torch.Tensor, history: torch.Tensor) -> tuple[
     output = convolution.squeeze(0).transpose(0, 1)
     if layer.activation:
         output = F.silu(output)
-    return output, combined[-(width - 1) :].detach().clone()
+    return output, combined[-(width - 1) :]
 
 
 def _run_gdn(
@@ -63,7 +62,7 @@ def _compose(state: torch.Tensor, transition: torch.Tensor, zero_state: torch.Te
     return torch.bmm(state.float(), transition.float()) + zero_state.float()
 
 
-def forward_hypic_gdn(
+def _forward_hypic_gdn_request(
     layer: Any,
     mixed_qkv: torch.Tensor,
     b: torch.Tensor,
@@ -71,13 +70,17 @@ def forward_hypic_gdn(
     core_attn_out: torch.Tensor,
     context: HypicBatchContext,
     attn_metadata: Any,
+    request_id: str,
+    request_index: int,
 ) -> None:
-    """Execute HYPIC S/T composition and seeded replay for one GDN layer."""
-    if len(context.request_ids) != 1:
-        raise RuntimeError("HYPIC GDN currently requires max_num_seqs=1")
-    request_id = context.request_ids[0]
+    """Execute HYPIC S/T composition for one request in a packed batch."""
     plan = context.plans[request_id]
     layer_name = str(layer.prefix)
+    conv_pool = getattr(layer, "hypic_conv_pool", None)
+    zero_state_pool = getattr(layer, "hypic_zero_state_pool", None)
+    transition_pool = getattr(layer, "hypic_transition_pool", None)
+    if conv_pool is None or zero_state_pool is None or transition_pool is None:
+        raise RuntimeError(f"HYPIC static GDN pool is missing for {layer_name}")
     num_tokens = len(plan["query_positions"])
     mixed_qkv = mixed_qkv[:num_tokens]
     a = a[:num_tokens]
@@ -89,7 +92,7 @@ def forward_hypic_gdn(
     a_parts: list[torch.Tensor] = []
     b_parts: list[torch.Tensor] = []
     units: list[dict[str, Any]] = []
-    cache_writes: list[tuple[dict[str, Any], int, torch.Tensor]] = []
+    cache_writes: list[tuple[dict[str, Any], int, int]] = []
     packed_offset = 0
 
     for segment in plan["segments"]:
@@ -99,8 +102,8 @@ def forward_hypic_gdn(
         raw = mixed_qkv[packed_offset : packed_offset + query_len]
         part_a = a[packed_offset : packed_offset + query_len]
         part_b = b[packed_offset : packed_offset + query_len]
-        cached = context.cache.get(segment["hash"], layer_name) if hit else None
-        if hit and cached is None:
+        slot = context.cache.lookup(segment["hash"]) if segment["cacheable"] else None
+        if segment["cacheable"] and slot is None:
             raise RuntimeError(
                 f"HYPIC scheduler/worker GDN cache divergence for segment {segment['hash']} at {layer_name}"
             )
@@ -116,20 +119,23 @@ def forward_hypic_gdn(
         if hit:
             if query_len:
                 units.append({"segment": segment, "kind": "seam", "length": query_len})
-            history = cached.conv_tail
+            history = conv_pool[slot]
         else:
             history = raw_tail
+            if segment["cacheable"]:
+                conv_pool[slot].copy_(history)
+                history = conv_pool[slot]
             seam = int(segment["recompute_seam"])
             if seam:
                 units.append({"segment": segment, "kind": "seam", "length": seam})
                 interior_index = len(units)
                 units.append({"segment": segment, "kind": "interior", "length": length - seam})
-                cache_writes.append((segment, interior_index, history))
+                cache_writes.append((segment, interior_index, slot))
             else:
                 unit_index = len(units)
                 units.append({"segment": segment, "kind": "full", "length": length})
                 if segment["cacheable"]:
-                    cache_writes.append((segment, unit_index, history))
+                    cache_writes.append((segment, unit_index, slot))
         packed_offset += query_len
 
     if packed_offset != num_tokens:
@@ -139,6 +145,10 @@ def forward_hypic_gdn(
     joined_a = torch.cat(a_parts, dim=0)
     joined_b = torch.cat(b_parts, dim=0)
     g, beta = DeviceOperator.fused_gdn_gating(layer.A_log, joined_a, joined_b, layer.dt_bias)
+    # q/k/v and g/beta own everything needed below. Drop the per-segment
+    # convolution outputs and concatenation inputs before allocating FP32 state
+    # workspaces for long prompts.
+    del transformed, transformed_parts, a_parts, b_parts, joined_a, joined_b
     lengths = [int(unit["length"]) for unit in units]
     cu_seqlens = torch.tensor(
         [0, *torch.tensor(lengths).cumsum(0).tolist()],
@@ -157,24 +167,19 @@ def forward_hypic_gdn(
     _, zero_states = _run_gdn(layer, q, k, v, g, beta, zero, cu_seqlens)
     identity = torch.zeros_like(zero)
     identity.diagonal(dim1=-2, dim2=-1).fill_(1)
+    del zero
     v_zero = v.new_zeros((1, v.shape[1], num_heads, key_dim))
     _, transitions = _run_gdn(layer, q, k, v_zero, g, beta, identity, cu_seqlens)
+    del identity, v_zero
     zero_states = zero_states.float()
     transitions = transitions.float()
 
-    for segment, unit_index, conv_tail in cache_writes:
-        context.cache.put(
-            segment["hash"],
-            layer_name,
-            LayerSegmentState(
-                conv_tail=conv_tail,
-                zero_state=zero_states[unit_index].detach().clone(),
-                transition=transitions[unit_index].detach().clone(),
-            ),
-        )
+    for _, unit_index, slot in cache_writes:
+        zero_state_pool[slot].copy_(zero_states[unit_index])
+        transition_pool[slot].copy_(transitions[unit_index])
 
-    accumulated = zero[0]
-    replay_initial = torch.zeros_like(zero)
+    accumulated = torch.zeros_like(zero_states[0])
+    replay_initial = torch.empty_like(zero_states)
     unit_cursor = 0
     for segment in plan["segments"]:
         hit = bool(segment["hit"])
@@ -187,8 +192,16 @@ def forward_hypic_gdn(
             )
             unit_cursor += 1
         if hit:
-            cached = context.cache.get(segment["hash"], layer_name)
-            accumulated = _compose(accumulated, cached.transition, cached.zero_state)
+            slot = context.cache.lookup(segment["hash"])
+            if slot is None:
+                raise RuntimeError(
+                    f"HYPIC GDN slot disappeared for segment {segment['hash']} at {layer_name}"
+                )
+            accumulated = _compose(
+                accumulated,
+                transition_pool[slot],
+                zero_state_pool[slot],
+            )
             continue
         number_of_units = 2 if int(segment["recompute_seam"]) else 1
         for _ in range(number_of_units):
@@ -200,12 +213,55 @@ def forward_hypic_gdn(
             )
             unit_cursor += 1
 
+    state_indices = attn_metadata.prefill_state_indices
+    if state_indices is None or request_index >= len(state_indices):
+        raise RuntimeError(
+            f"HYPIC GDN state metadata is missing request {request_index}"
+        )
+    state_index = state_indices[request_index].to(torch.long)
+    layer.kv_cache[1][state_index] = accumulated.to(layer.kv_cache[1].dtype)
+    layer.kv_cache[0][state_index] = history.to(layer.kv_cache[0].dtype)
+
+    # Seeded replay only consumes q/k/v/g/beta and replay_initial. Release the
+    # two per-segment FP32 result sets before entering the third GDN pass so the
+    # kernel workspace can reuse their allocator blocks instead of pushing the
+    # NPU to its memory limit.
+    del zero_states, transitions, cache_writes, accumulated
+
     output, _ = _run_gdn(layer, q, k, v, g, beta, replay_initial, cu_seqlens)
     core_attn_out[:num_tokens] = output.squeeze(0)
 
-    state_indices = attn_metadata.prefill_state_indices
-    if state_indices is None or len(state_indices) != 1:
-        raise RuntimeError("HYPIC GDN expected exactly one prefill state slot")
-    state_index = state_indices[0].to(torch.long)
-    layer.kv_cache[1][state_index] = accumulated.to(layer.kv_cache[1].dtype)
-    layer.kv_cache[0][state_index] = history.to(layer.kv_cache[0].dtype)
+
+def forward_hypic_gdn(
+    layer: Any,
+    mixed_qkv: torch.Tensor,
+    b: torch.Tensor,
+    a: torch.Tensor,
+    core_attn_out: torch.Tensor,
+    context: HypicBatchContext,
+    attn_metadata: Any,
+) -> None:
+    """Execute independent HYPIC state composition for a packed request batch."""
+    packed_offset = 0
+    for request_index, request_id in enumerate(context.request_ids):
+        plan = context.plans[request_id]
+        num_tokens = len(plan["query_positions"])
+        packed_end = packed_offset + num_tokens
+        _forward_hypic_gdn_request(
+            layer,
+            mixed_qkv[packed_offset:packed_end],
+            b[packed_offset:packed_end],
+            a[packed_offset:packed_end],
+            core_attn_out[packed_offset:packed_end],
+            context,
+            attn_metadata,
+            request_id,
+            request_index,
+        )
+        packed_offset = packed_end
+
+    num_actual_tokens = int(attn_metadata.num_actual_tokens)
+    if packed_offset != num_actual_tokens:
+        raise RuntimeError(
+            f"HYPIC GDN consumed {packed_offset} of {num_actual_tokens} packed tokens"
+        )

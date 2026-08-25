@@ -33,12 +33,10 @@ HYPIC 的实现原理和适配注意事项见 [HYPIC 在 vLLM Ascend 上的适�
 - 相同数据文件和 index 顺序；
 - TP=2、eager execution。
 
-当前 HYPIC 实现要求 `max_num_seqs=1`，所以推荐：
-
-- Full Recompute 使用 batch=4，与 SGLang B4 基线更接近；
-- HYPIC 使用 batch=1。
-
-这可以比较任务准确率，但 HYPIC 的请求 admission 和 cache hit 历史不与 SGLang rolling B4 完全相同。报告中必须注明这一点，不应把该实验当成严格的吞吐或逐 token 等价对拍。
+Full Recompute 和 HYPIC 都推荐使用 batch=4，与 SGLang B4 基线保持一致。HYPIC
+调度器会将一组 HYPIC prefill 与已有 decode 请求隔离；`max_num_batched_tokens` 控制每步
+总 token 预算。因此 batch=4 表示最大并发数为 4，超长 prompt 的 token 总数超过预算时，
+调度器可能分成多个 admission group。报告中应同时记录 batch size 和 token budget。
 
 ## 2. 已验证配置
 
@@ -49,14 +47,15 @@ HYPIC 的实现原理和适配注意事项见 [HYPIC 在 vLLM Ascend 上的适�
 | 模型 | Qwen3.5-35B-A3B | Qwen3.5-35B-A3B |
 | NPU / TP | 2 / 2 | 2 / 2 |
 | max model length | 45056 | 45056 |
-| batch size | 4 | 1 |
-| GPU/NPU memory utilization | 0.85 | 0.70 |
-| max cache segments | - | 256 |
+| batch size | 4 | 4 |
+| max batched tokens | 45056 | 45056 |
+| GPU/NPU memory utilization | 0.85 | 0.85 |
+| max cache segments | - | 96 |
 | seam sink tokens | - | 8 |
 
 `max_model_len=45056` 是根据四个数据集中最长约 41.2k-token 的输入留余量得到的。不要用默认 8192 跑完整 LongBench-E。
 
-HYPIC cache tensor 是按需分配的。256 segments 时降低 vLLM KV cache 的内存比例，可以为 Full Attention public KV 和 GDN state 留出空间。不同模型、NPU 容量或 kernel 版本应重新测量，不能照抄 0.70 后假设一定安全。
+HYPIC 的 Full Attention public KV、conv tail 和 GDN `S/T` 使用模型构造阶段预分配的 96-slot 固定 pool。vLLM 会先把这些 buffer 计入模型占用，再按 `gpu_memory_utilization` 计算普通 KV cache，因此不需要在运行期为按需 `clone()` 额外预留一块不可见空间。该实机配置在每卡 profile 到约 39.01 GiB 模型占用、4.15 GiB peak activation 和 8.19 GiB 普通 KV cache。不同模型、NPU 容量或 kernel 版本仍应重新测量。
 
 ## 3. 目录和环境
 
@@ -196,13 +195,13 @@ python examples/offline_inference/hypic_longbench.py \
   --reference-prefix hypic_512 \
   --mode hypic \
   --chunk-size 512 \
-  --max-cache-segments 256 \
+  --max-cache-segments 96 \
   --seed 20260825 \
   --samples-per-dataset 1 \
   --min-input-tokens 0 \
   --max-input-tokens 50000 \
   --max-model-len 45056 \
-  --gpu-memory-utilization 0.70 \
+  --gpu-memory-utilization 0.85 \
   --output "$LONGBENCH_ROOT/smoke_hypic_512.json"
 ```
 
@@ -217,13 +216,13 @@ python examples/offline_inference/hypic_longbench.py \
   --reference-prefix hypic_1024 \
   --mode hypic \
   --chunk-size 1024 \
-  --max-cache-segments 256 \
+  --max-cache-segments 96 \
   --seed 20260825 \
   --samples-per-dataset 1 \
   --min-input-tokens 0 \
   --max-input-tokens 50000 \
   --max-model-len 45056 \
-  --gpu-memory-utilization 0.70 \
+  --gpu-memory-utilization 0.85 \
   --output "$LONGBENCH_ROOT/smoke_hypic_1024.json"
 ```
 
@@ -237,6 +236,33 @@ python examples/offline_inference/hypic_longbench.py \
 - 单条分数差异要结合答案和文本检查，不能因为某条 F1 为 0 就直接判断 runtime 错误。
 
 `temperature=0` 仍不保证 SGLang 与 vLLM 逐 token 相同。不同 Attention/GDN kernel 的 BF16 数值差异可能改变贪心路径，摘要任务尤其敏感。因此以官方 metric 和完整数据集趋势为主，exact text match 作为辅助信号。
+
+### 5.4 固定种子采样实测结果
+
+静态 segment pool 实现完成后，使用 seed `20260824`、每个数据集 2 条，在
+Qwen3.5-35B-A3B、TP=2、`max_model_len=45056`、
+`gpu_memory_utilization=0.85`、`max_cache_segments=96` 的 Ascend 实机上执行上述
+闸门。采样严格沿用各 SGLang mode 的原始 index；下面的差值均为 vLLM cold 减
+SGLang，单位为百分点：
+
+| 模式 | Qasper | HotpotQA | GovReport | MultiNews | 8 条均分差 | 平均绝对差 | 最大绝对差 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| HYPIC-512 | +0.000 | +0.000 | +1.959 | -0.325 | +0.408 | 0.571 | 2.639 |
+| HYPIC-1024 | +0.000 | +0.000 | -1.130 | +0.417 | -0.178 | 0.387 | 1.897 |
+
+这里 Qasper 和 HotpotQA 各列是两条样本的均值，两种 chunk 的 4 条 QA 样本都与
+SGLang 零分差。HYPIC-512 和 HYPIC-1024 的 SGLang/vLLM cold 总体均分分别为
+`42.523/42.931` 和 `42.934/42.756`，没有系统性下降，因此采样闸门通过。
+
+同一请求的 warm hit 相对 cold 的平均绝对分差分别为 0.760 和 0.409，最大绝对分差
+分别为 1.532 和 2.419；cold/warm token IDs 完全一致分别为 2/8 和 4/8。HYPIC 会用
+BF16 public state 和 transition 重建前缀，命中路径与 cold 全量路径不保证 bitwise
+相同，因此应同时检查官方分数和文本语义。此次所有 warm 输出均非空、可读，未出现
+明显上下文丢失。
+
+采样结果 JSON 可用以下字段复核：`index`、`sglang_score`、`vllm_cold_score`、
+`vllm_warm_score`、`sglang_vllm_text_match` 和 `cold_warm_token_match`。只有采样闸门
+通过后才启动下一节的完整实验；采样结论不能替代四个数据集的完整准确率。
 
 ## 6. 运行完整测试
 
@@ -259,7 +285,7 @@ python examples/offline_inference/hypic_longbench_full.py \
   --gpu-memory-utilization 0.85
 ```
 
-### 6.2 HYPIC chunk 512，batch 1
+### 6.2 HYPIC chunk 512，batch 4
 
 ```bash
 python examples/offline_inference/hypic_longbench_full.py \
@@ -272,12 +298,13 @@ python examples/offline_inference/hypic_longbench_full.py \
   --run-name hypic_512 \
   --max-model-len 45056 \
   --tensor-parallel-size 2 \
-  --batch-size 1 \
-  --gpu-memory-utilization 0.70 \
-  --max-cache-segments 256
+  --batch-size 4 \
+  --max-num-batched-tokens 45056 \
+  --gpu-memory-utilization 0.85 \
+  --max-cache-segments 96
 ```
 
-### 6.3 HYPIC chunk 1024，batch 1
+### 6.3 HYPIC chunk 1024，batch 4
 
 ```bash
 python examples/offline_inference/hypic_longbench_full.py \
@@ -290,12 +317,14 @@ python examples/offline_inference/hypic_longbench_full.py \
   --run-name hypic_1024 \
   --max-model-len 45056 \
   --tensor-parallel-size 2 \
-  --batch-size 1 \
-  --gpu-memory-utilization 0.70 \
-  --max-cache-segments 256
+  --batch-size 4 \
+  --max-num-batched-tokens 45056 \
+  --gpu-memory-utilization 0.85 \
+  --max-cache-segments 96
 ```
 
-runner 会拒绝 HYPIC `--batch-size` 大于 1，避免把正确性限制误当作调优建议绕过。
+提高 `--max-num-batched-tokens` 可以让更多长 prompt 同时 prefill，但会增大 activation
+和 workspace 峰值。应先保持 45056，通过 NPU 峰值确认有余量后再逐步增加。
 
 ## 7. 后台串行运行
 
@@ -316,15 +345,17 @@ tmux new-session -d -s vllm_longbench_e \
     --config-dir $LONGBENCH_CONFIG --output-dir $VLLM_RESULTS \
     --mode hypic --chunk-size 512 --run-name hypic_512 \
     --max-model-len 45056 --tensor-parallel-size 2 \
-    --batch-size 1 --gpu-memory-utilization 0.70 \
-    --max-cache-segments 256 >> $VLLM_RESULTS/run.log 2>&1 && \
+    --batch-size 4 --max-num-batched-tokens 45056 \
+    --gpu-memory-utilization 0.85 \
+    --max-cache-segments 96 >> $VLLM_RESULTS/run.log 2>&1 && \
   python examples/offline_inference/hypic_longbench_full.py \
     --model $HYPIC_MODEL --data-dir $LONGBENCH_DATA \
     --config-dir $LONGBENCH_CONFIG --output-dir $VLLM_RESULTS \
     --mode hypic --chunk-size 1024 --run-name hypic_1024 \
     --max-model-len 45056 --tensor-parallel-size 2 \
-    --batch-size 1 --gpu-memory-utilization 0.70 \
-    --max-cache-segments 256 >> $VLLM_RESULTS/run.log 2>&1"
+    --batch-size 4 --max-num-batched-tokens 45056 \
+    --gpu-memory-utilization 0.85 \
+    --max-cache-segments 96 >> $VLLM_RESULTS/run.log 2>&1"
 ```
 
 `&&` 保证某一阶段失败时不会掩盖错误并继续下一阶段。
@@ -461,6 +492,40 @@ PY
 
 参考值只适用于相同数据、模型、prompt 和 scoring 版本。任何一项变化都应重新生成基线。
 
+### 10.1 完整实测结果
+
+Qwen3.5-35B-A3B、TP=2 的完整 LongBench-E 实测结果如下。HYPIC 使用 batch=4、
+`max_num_batched_tokens=45056`、`gpu_memory_utilization=0.85` 和 96-slot 静态
+segment pool；每个 mode 都包含 Qasper 224 条、GovReport 300 条、HotpotQA 300 条和
+MultiNews 294 条：
+
+| 模式 / Runtime | Qasper | GovReport | HotpotQA | MultiNews | Macro |
+|---|---:|---:|---:|---:|---:|
+| Full Recompute / SGLang | 47.48 | 31.41 | 72.02 | 23.11 | 43.50 |
+| Full Recompute / vLLM | 48.36 | 31.48 | 71.90 | 23.13 | 43.72 |
+| 差值 | +0.88 | +0.07 | -0.12 | +0.02 | +0.22 |
+| HYPIC-512 / SGLang | 48.24 | 31.39 | 72.10 | 23.20 | 43.73 |
+| HYPIC-512 / vLLM | 48.48 | 31.52 | 71.72 | 23.07 | 43.70 |
+| 差值 | +0.24 | +0.13 | -0.38 | -0.13 | -0.03 |
+| HYPIC-1024 / SGLang | 48.12 | 31.26 | 71.56 | 23.13 | 43.52 |
+| HYPIC-1024 / vLLM | 47.84 | 31.43 | 71.97 | 23.06 | 43.58 |
+| 差值 | -0.28 | +0.17 | +0.41 | -0.07 | +0.06 |
+
+三种 mode 的 Macro 差值绝对值均不超过 0.22，两个 HYPIC mode 分别为 -0.03 和
++0.06；没有数据集出现系统性准确率下降。运行中覆盖了 batch=4 和约 37k-token 的
+长输入，未出现 NPU OOM、cache divergence 或 `mamba_pool exhausted`。因此完整准确率
+验证通过。
+
+本次 HYPIC-512 的 Qasper 在 188/224 处为执行固定样本验证而主动中断，随后从结果
+JSONL 续跑；其余 HYPIC 数据集以及完整 HYPIC-1024 均在各自 engine 生命周期内连续
+完成。断点后的进程内 cache history 会重新建立，因此该结果用于准确率验证，不用于
+严格复现连续 rolling-cache 的命中率或吞吐。
+
+结果目录：
+
+- Full Recompute：`/data/hypic-validation/longbench_v1/results_e_vllm_ascend_b1`；
+- HYPIC-512/1024：`/data/hypic-validation/longbench_v1/results_e_vllm_ascend_static_b4`。
+
 ## 11. 常见异常排查
 
 ### 11.1 Qasper 分数异常
@@ -507,10 +572,10 @@ PY
 
 ### 11.3 NPU OOM
 
-- 降低 HYPIC `gpu_memory_utilization`，为按需 segment cache 留空间；
-- 降低 `max_cache_segments`；
-- 先用 128 segments 确认正确性，再逐步增加；
-- 同时观察 vLLM KV cache、HYPIC public KV/GDN state 和长 prefill workspace，不能只看 engine 启动时的剩余显存。
+- 确认启动日志已经把 HYPIC pool 计入模型占用，并记录 KV cache 和 peak activation；
+- 检查 `max_cache_segments >= ceil(max_num_batched_tokens / chunk_size) - 1`；
+- 在满足最低 slot 数后，必要时降低 `gpu_memory_utilization`，让 vLLM 缩小普通 KV cache；
+- 用最长 prompt 和 batch=4 重现峰值，同时扫描 NPU OOM，不能只看 engine 启动时的剩余显存。
 
 ### 11.4 结果文件条数不够
 

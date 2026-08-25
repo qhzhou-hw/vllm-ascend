@@ -19,7 +19,7 @@ LongBench-E 的具体实验命令见 [HYPIC LongBench-E 测试指南](evaluation
 
 - 支持 Qwen3.5 dense/MoE 的文本 hybrid-attention 路径。
 - 仅支持 `transition_rope_recompute`。
-- 支持 Tensor Parallel；当前要求 `max_num_seqs=1`。
+- 支持 Tensor Parallel 和多请求 batch；`max_num_seqs` 可按显存和吞吐需求配置。
 - 不支持 PP、DP、PCP、DCP、speculative decoding 和 KV transfer/disaggregation。
 - 要求 eager execution；HYPIC prefill 必须一次调度完整 prompt。
 - cache 为进程内状态，engine 退出后清空。
@@ -64,7 +64,7 @@ llm = LLM(
     model="/path/to/Qwen3.5-35B-A3B",
     tensor_parallel_size=2,
     enforce_eager=True,
-    max_num_seqs=1,
+    max_num_seqs=4,
     max_model_len=45056,
     max_num_batched_tokens=45056,
     additional_config={
@@ -73,7 +73,7 @@ llm = LLM(
             "mode": "transition_rope_recompute",
             "chunk_size": 512,
             "seam_sink_tokens": 8,
-            "max_cache_segments": 128,
+            "max_cache_segments": 96,
         }
     },
 )
@@ -83,7 +83,8 @@ llm = LLM(
 
 - 强制 eager；
 - 禁用 scheduler chunked prefill；
-- 将 `max_num_seqs` 设为 1；
+- 保留用户设置的 `max_num_seqs`；当已有请求在 decode 时，暂缓接纳新的 HYPIC
+  prefill，避免把自定义稀疏 prefill 和普通 decode 混入同一次 model forward；
 - 让 `max_num_scheduled_tokens` 等于 `max_num_batched_tokens`，避免 hybrid 模型默认的 2048-token 调度上限拆开 HYPIC prompt；
 - 保持 vLLM prefix caching 开启，以满足 hybrid cache 的 page-size 校验，但 HYPIC 会绕过标准 prefix hit 并独立维护 segment cache。
 
@@ -172,9 +173,16 @@ H_next = H_previous @ T + S
 
 ### 3.8 Cache 和 LRU
 
-Scheduler 保存 digest 到完整 token tuple 的 host catalog；每个 worker 保存逐层 NPU tensor。二者使用同一容量和访问顺序维护 LRU。
+Scheduler 保存 digest 到完整 token tuple 的 host catalog；worker 只保存 digest 到 slot ID 的映射。逐层 NPU tensor 不再挂在 LRU entry 上按需 `clone()`，而是在模型构造阶段一次性注册为固定 buffer：
 
-注意：vLLM Ascend 的 `max_cache_segments` 同时限制 Full Attention public KV 和 GDN state 的 segment 数。它和 SGLang 的 `max_mamba_cache_size` 都以 segment/state slot 为主要概念，但占用的物理内存不等价，不能直接根据同一个数值推断显存一定可用。
+- Full Attention：每层 key/value slot pool；
+- GDN：每层 conv tail、FP32 `S` 和 FP32 `T` slot pool。
+
+这些 buffer 与模型一起分配，因此 vLLM 在 profile activation 并计算普通 KV cache 容量时已经能看到其显存占用。运行期只覆盖 slot 内容，不再随命中历史向 NPU allocator 追加小 tensor。
+
+一个 packed forward 使用的所有 cacheable segment 会在进入第一层之前统一获得稳定 slot。先按 scheduler 顺序 touch hit，再为 miss 分配 slot，之后各层只查表而不改变 LRU。这样可避免前层为 miss 分配 slot 时淘汰后层尚未读取的 hit。
+
+`max_cache_segments` 同时决定 Full Attention public KV 和 GDN state pool 的 slot 数。配置必须至少为 `ceil(max_num_batched_tokens / chunk_size) - 1`，否则一批请求可能没有足够的稳定 slot，启动时会直接拒绝配置。它和 SGLang 的 `max_mamba_cache_size` 都以 slot 为主要概念，但每个 slot 的 tensor 组成不同，不能直接根据同一个数值推断显存一定可用。
 
 一旦 scheduler 判定 hit 而 worker 找不到对应 layer state，必须立即报 cache divergence，不能静默回退；静默回退会让当前 plan 的 token 数和 worker 实际需要的 token 数不一致。
 
@@ -255,9 +263,33 @@ pytest -q tests/ut/hypic/test_hypic.py
 
 用 Qasper、GovReport、HotpotQA、MultiNews 各抽至少一条，同时覆盖短答案和 512-token 摘要。先比较单样本官方 metric，再比较文本；跨运行时 greedy decoding 不保证 bitwise 相同。
 
-### 5.5 完整 LongBench-E
+### 5.5 固定种子采样结果
+
+在 Qwen3.5-35B-A3B、TP=2、`max_cache_segments=96` 的 Ascend 实机上，使用 seed
+`20260824`，从每个数据集按 SGLang 原始 index 固定抽取 2 条，共 8 条。每条先运行
+cold 请求，再重复相同请求检查 warm hit。cold 输出与相同 chunk 的 SGLang Ascend B4
+原始输出计算相同的官方单样本 metric，结果如下（单位为百分点）：
+
+| 模式 | SGLang 均分 | vLLM cold 均分 | 有符号差 | 平均绝对差 | 最大绝对差 | 分数完全一致 |
+|---|---:|---:|---:|---:|---:|---:|
+| HYPIC-512 | 42.523 | 42.931 | +0.408 | 0.571 | 2.639 | 4/8 |
+| HYPIC-1024 | 42.934 | 42.756 | -0.178 | 0.387 | 1.897 | 4/8 |
+
+两种 chunk 下，Qasper 和 HotpotQA 的 4 条 QA 样本均为零分差；差异来自生成式摘要的
+措辞变化，未观察到系统性准确率下降。逐文本完全一致均为 3/8，只作为数值路径诊断，
+不作为跨 runtime 的准确率闸门。warm 相对 cold 的平均绝对分差分别为 0.760 和 0.409，
+最大绝对分差分别为 1.532 和 2.419，未出现空输出、乱码或上下文丢失。详细命令和按
+数据集统计见配套 LongBench 文档。
+
+### 5.6 完整 LongBench-E
 
 采样闸门通过后再运行 Full Recompute、HYPIC-512 和 HYPIC-1024。完整流程见配套 LongBench 文档。
+
+本次完整结果的 Macro 为：Full Recompute `43.72`、HYPIC-512 `43.70`、
+HYPIC-1024 `43.58`；对应 SGLang Ascend B4 分别为 `43.50`、`43.73`、`43.52`，
+差值为 `+0.22`、`-0.03`、`+0.06`。三种 mode 均完成全部 1118 条样本，且完整运行中
+未出现 NPU OOM、cache divergence 或 pool exhaustion。逐数据集结果和断点续跑说明见
+配套 LongBench 文档。
 
 ## 6. 值得注意的坑
 
@@ -285,13 +317,24 @@ pytest -q tests/ut/hypic/test_hypic.py
 
 HYPIC 模式内部保留 vLLM prefix caching 配置以通过 hybrid-cache 校验，但标准 computed-block hit 已被 HYPIC planner 接管。Full Recompute 基线则必须关闭 prefix caching。
 
-### 6.7 显存要为按需 segment cache 留余量
+### 6.7 静态 segment pool 必须纳入显存预算
 
-提高 `gpu_memory_utilization` 会增大 vLLM KV cache，却压缩 HYPIC public KV/GDN tensor 的动态空间。长测使用 256 segments 时，本次验证把 HYPIC 的 `gpu_memory_utilization` 降到 0.70；默认 128 segments 可从 0.85 起测。具体值应通过最长请求和 cache 填满后的 NPU 峰值确定。
+HYPIC public KV、conv tail 和 GDN `S/T` 在模型构造阶段预分配，vLLM 会把它们计入模型占用，再依据 `gpu_memory_utilization` 缩放普通 KV cache。Qwen3.5-35B-A3B、TP=2、96 slots 的实测模型占用为每卡约 39.01 GiB；`gpu_memory_utilization=0.85` 时 vLLM 自动留下约 8.19 GiB 普通 KV cache，并在 profile 中记录约 4.15 GiB peak activation。
 
-### 6.8 当前只能单序列 HYPIC
+增大 `max_cache_segments` 会线性扩大模型 buffer，减小普通 KV cache；减小它又必须满足当前 batch token budget 的最低 slot 数。调参时应同时验证 engine profile、最长 prompt、batch=4 峰值和 warm hit，不能只观察启动后的空闲显存。
 
-`max_num_seqs=1` 是正确性约束，不只是保守性能参数。Full Recompute 可以 batch=4；HYPIC 不能直接把 runner batch 调到 4。若参考 SGLang 使用 rolling B4，必须在报告中注明 cache admission 顺序不同。
+### 6.8 Batch 中每个请求必须独立维护 HYPIC 状态
+
+HYPIC 支持 `max_num_seqs > 1`，但不能把单请求实现简单地扩成一份共享 plan。ModelRunner
+必须按请求顺序分别选择稀疏 token 和绝对位置，并为每个请求使用自己的 paged-cache
+block-table row、GDN decode state slot 和 segment plan。一次 forward 的 plan 应建立快照，
+不能只保留循环中的最后一个请求。
+
+调度器允许多个 waiting request 一起进入 HYPIC prefill；该请求组进入 decode 后，会先
+排空当前 running group，再接纳下一组 prefill。这样既保留批量 prefill/decode，又避免
+混合自定义 prefill 与普通 decode。`max_num_batched_tokens` 仍是每个 scheduler step 的
+总 token 预算，因此 `max_num_seqs=4` 表示最多并发 4 个请求，不保证四个最长 prompt
+一定能在同一步进入 prefill。
 
 ### 6.9 断点续跑会改变 HYPIC cache 历史
 
@@ -314,5 +357,8 @@ HYPIC 模式内部保留 vLLM prefix caching 配置以通过 hybrid-cache 校验
 - [ ] GDN kernel 边界执行 state layout 转换。
 - [ ] transition 按 prompt 顺序用 FP32 组合。
 - [ ] 最终 conv/recurrent state 写入 decode slot。
+- [ ] batch 内每个请求使用独立 plan、block-table row 和 GDN state slot。
+- [ ] HYPIC prefill 不与普通 decode 混在同一次 forward。
 - [ ] scheduler 和 device LRU 不发生 divergence。
-- [ ] 真实 NPU 上完成 cold/warm、四数据集采样和 LongBench-E。
+- [x] 真实 NPU 上完成 cold/warm 和四数据集固定种子采样闸门。
+- [x] 真实 NPU 上完成完整 LongBench-E，并与 SGLang Ascend B4 基线对比。

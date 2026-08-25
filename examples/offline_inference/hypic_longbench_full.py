@@ -30,9 +30,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-model-len", type=int, default=45056)
     parser.add_argument("--tensor-parallel-size", type=int, default=2)
     parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument(
+        "--max-num-batched-tokens",
+        type=int,
+        default=0,
+        help=(
+            "Engine-wide token budget per scheduler step. Defaults to "
+            "--max-model-len; increase it when long prompts should prefill "
+            "concurrently."
+        ),
+    )
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.85)
     parser.add_argument("--seam-sink-tokens", type=int, default=8)
-    parser.add_argument("--max-cache-segments", type=int, default=128)
+    parser.add_argument(
+        "--max-cache-segments",
+        type=int,
+        default=96,
+        help=(
+            "Static HYPIC segment-pool slots. Must cover every cacheable "
+            "segment admitted by max_num_batched_tokens."
+        ),
+    )
     args = parser.parse_args()
     if args.mode == "hypic" and args.chunk_size <= 0:
         parser.error("--chunk-size must be positive in hypic mode")
@@ -40,8 +58,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--chunk-size must be 0 in full_recompute mode")
     if args.batch_size <= 0:
         parser.error("--batch-size must be positive")
-    if args.mode == "hypic" and args.batch_size != 1:
-        parser.error("HYPIC currently requires --batch-size 1")
+    if args.max_num_batched_tokens < 0:
+        parser.error("--max-num-batched-tokens cannot be negative")
     return args
 
 
@@ -68,7 +86,11 @@ def summarize(items: list[dict[str, Any]]) -> dict[str, Any]:
         "mean_latency": sum(item["latency"] for item in items) / len(items),
         "mean_input_tokens": sum(item["input_tokens"] for item in items) / len(items),
         "mean_cached_tokens": 0.0,
-        "length_buckets": {bucket: round(100 * sum(values) / len(values), 2) for bucket, values in buckets.items()},
+        "length_buckets": {
+            bucket: round(100 * sum(values) / len(values), 2)
+            for bucket, values in buckets.items()
+            if values
+        },
     }
 
 
@@ -86,13 +108,21 @@ def write_summary(
         ),
         "datasets": dataset_summaries,
     }
-    if all("length_buckets" in item for item in dataset_summaries.values()):
+    populated_buckets = [
+        bucket
+        for bucket in ("0-4k", "4-8k", "8k+")
+        if all(
+            bucket in item.get("length_buckets", {})
+            for item in dataset_summaries.values()
+        )
+    ]
+    if populated_buckets:
         summary["length_bucket_macro_average"] = {
             bucket: round(
                 sum(item["length_buckets"][bucket] for item in dataset_summaries.values()) / len(dataset_summaries),
                 2,
             )
-            for bucket in ("0-4k", "4-8k", "8k+")
+            for bucket in populated_buckets
         }
     target = output_dir / f"{run_name}.summary.json"
     temporary = target.with_suffix(".json.tmp")
@@ -116,7 +146,9 @@ def main() -> None:
         enforce_eager=True,
         max_num_seqs=args.batch_size,
         max_model_len=args.max_model_len,
-        max_num_batched_tokens=args.max_model_len,
+        max_num_batched_tokens=(
+            args.max_num_batched_tokens or args.max_model_len
+        ),
         gpu_memory_utilization=args.gpu_memory_utilization,
     )
     if args.mode == "hypic":
