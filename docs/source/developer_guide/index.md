@@ -16,6 +16,7 @@ This section is for developers who want to contribute to vLLM Ascend or understa
 Explore the design documents covering patch architecture, CPU binding, model runner internals, disaggregated prefill, EPLB, ACL Graph, KV Cache Pool, custom operators, context parallel, quantization, and NPUGraph.
 
 - **[HYPIC Ascend 适配说明](hypic_ascend_porting_zh.md)** — HYPIC 在 vLLM Ascend 上的架构、迁移步骤、验证方法和注意事项
+- **[HYPIC Segment Cache 一致性修复](hypic_cache_consistency_fix_zh.md)** — Scheduler/worker LRU 分叉、权威驱逐协议和回归方法
 
 ## Evaluation
 

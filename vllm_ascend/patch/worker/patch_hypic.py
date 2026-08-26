@@ -126,7 +126,12 @@ def _prepare_inputs(
         set_hypic_context(None)
         return result
 
-    new_request_ids = {request_data.req_id for request_data in scheduler_output.scheduled_new_reqs}
+    planned_request_ids = tuple(
+        request_data.req_id
+        for request_data in scheduler_output.scheduled_new_reqs
+        if request_data.req_id in self.hypic_plans
+    )
+    new_request_ids = set(planned_request_ids)
     active_ids = tuple(
         request_id
         for request_id in self.input_batch.req_ids
@@ -139,6 +144,11 @@ def _prepare_inputs(
         raise RuntimeError(
             "HYPIC requires a prefill-only batch; mixed prefill/decode "
             "forward detected"
+        )
+    if active_ids != planned_request_ids:
+        raise RuntimeError(
+            "HYPIC scheduler/worker request order divergence: "
+            f"scheduler={planned_request_ids}, worker={active_ids}"
         )
 
     # Assign every active segment a stable slot before the first model layer.

@@ -2,7 +2,7 @@
 
 本文总结将 HYPIC 从 SGLang Ascend 实现迁移到 vLLM Ascend 的设计、实现步骤、验证方法和容易出错的地方。当前实现以 Qwen3.5 hybrid-attention 模型为首个验证目标，使用 `transition_rope_recompute` 模式。
 
-LongBench-E 的具体实验命令见 [HYPIC LongBench-E 测试指南](evaluation/hypic_longbench_zh.md)。面向使用者的简要配置见 [HYPIC 功能说明](../user_guide/feature_guide/hypic.md)。
+LongBench-E 的具体实验命令见 [HYPIC LongBench-E 测试指南](evaluation/hypic_longbench_zh.md)。面向使用者的简要配置见 [HYPIC 功能说明](../user_guide/feature_guide/hypic.md)。Scheduler/worker LRU 同步协议及槽满驱逐问题的修复记录见 [HYPIC Segment Cache 一致性修复](hypic_cache_consistency_fix_zh.md)。
 
 ## 1. 适配目标和当前边界
 
@@ -21,6 +21,7 @@ LongBench-E 的具体实验命令见 [HYPIC LongBench-E 测试指南](evaluation
 - 仅支持 `transition_rope_recompute`。
 - 支持 Tensor Parallel 和多请求 batch；`max_num_seqs` 可按显存和吞吐需求配置。
 - 不支持 PP、DP、PCP、DCP、speculative decoding 和 KV transfer/disaggregation。
+- 当前强制关闭 async scheduling；segment miss 必须在下一轮 schedule 前完成 commit。
 - 要求 eager execution；HYPIC prefill 必须一次调度完整 prompt。
 - cache 为进程内状态，engine 退出后清空。
 
@@ -82,6 +83,7 @@ llm = LLM(
 配置检查同时完成以下约束：
 
 - 强制 eager；
+- 关闭 async scheduling，确保每批 segment miss 在下一轮 cache planning 前完成 commit；
 - 禁用 scheduler chunked prefill；
 - 保留用户设置的 `max_num_seqs`；当已有请求在 decode 时，暂缓接纳新的 HYPIC
   prefill，避免把自定义稀疏 prefill 和普通 decode 混入同一次 model forward；

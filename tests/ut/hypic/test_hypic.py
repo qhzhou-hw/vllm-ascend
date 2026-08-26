@@ -189,6 +189,105 @@ def test_device_cache_rejects_unprepared_scheduler_hit() -> None:
         )
 
 
+def test_device_cache_rejects_lru_order_divergence_before_reserve() -> None:
+    cache = DeviceSegmentCache(2)
+    cache.prepare(
+        [{"segments": [{"hash": "A", "cacheable": True, "hit": False}]}]
+    )
+    cache.prepare(
+        [{"segments": [{"hash": "B", "cacheable": True, "hit": False}]}]
+    )
+
+    with pytest.raises(RuntimeError, match="cache order divergence"):
+        cache.prepare(
+            [
+                {
+                    "cache_order_before": ("B", "A"),
+                    "segments": [
+                        {"hash": "C", "cacheable": True, "hit": False}
+                    ],
+                }
+            ]
+        )
+
+    # The check happens before reserve can overwrite a resident slot.
+    assert tuple(cache.segments) == ("A", "B")
+
+
+def test_device_cache_rejects_scheduler_eviction_mismatch_before_reuse() -> None:
+    cache = DeviceSegmentCache(2)
+    cache.prepare(
+        [
+            {
+                "segments": [
+                    {"hash": "A", "cacheable": True, "hit": False},
+                    {"hash": "B", "cacheable": True, "hit": False},
+                ]
+            }
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="eviction divergence"):
+        cache.prepare(
+            [
+                {
+                    "segments": [
+                        {
+                            "hash": "C",
+                            "cacheable": True,
+                            "hit": False,
+                            "expected_eviction": "B",
+                        }
+                    ]
+                }
+            ]
+        )
+
+    assert tuple(cache.segments) == ("A", "B")
+
+
+def test_device_cache_replays_duplicate_misses_in_scheduler_lru_order() -> None:
+    """A repeated packed miss must refresh LRU exactly like the scheduler."""
+    catalog = SegmentCatalog(3)
+    cache = DeviceSegmentCache(3)
+
+    def plan(*digests: str, hit: bool = False) -> dict:
+        return {
+            "segments": [
+                {
+                    "hash": digest,
+                    "cacheable": True,
+                    "hit": hit,
+                    "token_ids": [ord(digest)],
+                }
+                for digest in digests
+            ]
+        }
+
+    # The second request sees A as cold because scheduler commits happen only
+    # after the entire packed forward. Its repeated miss must still move A to
+    # MRU when both sides apply the completed plans.
+    packed_plans = [plan("A", "B"), plan("A", "C")]
+    catalog.prepare_scheduled_plans(packed_plans)
+    assert packed_plans[-1]["cache_order_after_commit"] == ("B", "A", "C")
+    cache.prepare(packed_plans)
+    for packed_plan in packed_plans:
+        catalog.commit(packed_plan)
+
+    assert tuple(cache.segments) == tuple(catalog.ready) == ("B", "A", "C")
+
+    next_miss = plan("D")
+    catalog.prepare_scheduled_plans([next_miss])
+    assert next_miss["cache_order_after_commit"] == ("A", "C", "D")
+    assert next_miss["segments"][0]["expected_eviction"] == "B"
+    cache.prepare([next_miss])
+    scheduler_evictions = catalog.commit(next_miss)
+
+    assert scheduler_evictions == ["B"]
+    assert tuple(cache.segments) == tuple(catalog.ready) == ("A", "C", "D")
+    cache.prepare([plan("A", hit=True)])
+
+
 def test_hypic_attention_keeps_batched_request_prefixes_independent() -> None:
     config = HypicConfig(enabled=True, chunk_size=2, seam_sink_tokens=1)
     plans = {

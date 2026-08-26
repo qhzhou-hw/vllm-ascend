@@ -77,6 +77,10 @@ def _check_and_update_config(cls: type, vllm_config: Any) -> None:
             )
 
         model_config.enforce_eager = True
+        # SegmentCatalog commits misses only after the corresponding model
+        # output. Async scheduling could plan another batch against that
+        # uncommitted state while the worker has already reserved its slots.
+        vllm_config.scheduler_config.async_scheduling = False
         vllm_config.scheduler_config.enable_chunked_prefill = False
         # Hybrid models otherwise retain a 2048-token scheduling cap even when
         # max_num_batched_tokens is larger. HYPIC must plan and execute a whole
@@ -117,10 +121,23 @@ def _schedule(self: Scheduler, *args: Any, **kwargs: Any) -> Any:
     ):
         self._pause_state = PauseState.PAUSED_NEW
         try:
-            return _ORIGINAL_SCHEDULE(self, *args, **kwargs)
+            scheduler_output = _ORIGINAL_SCHEDULE(self, *args, **kwargs)
         finally:
             self._pause_state = PauseState.UNPAUSED
-    return _ORIGINAL_SCHEDULE(self, *args, **kwargs)
+    else:
+        scheduler_output = _ORIGINAL_SCHEDULE(self, *args, **kwargs)
+
+    catalog = getattr(self, "hypic_catalog", None)
+    if catalog is not None:
+        # Cache lookup may happen for a waiting request that is later rejected
+        # by token or block budgets. Only admitted requests may mutate the
+        # scheduler LRU, because only those plans reach the worker.
+        catalog.prepare_scheduled_plans(
+            plan
+            for request_data in scheduler_output.scheduled_new_reqs
+            if (plan := getattr(request_data, "hypic_plan", None)) is not None
+        )
+    return scheduler_output
 
 
 def _mamba_block_aligned_split(
@@ -161,7 +178,6 @@ def _get_computed_blocks(self: KVCacheManager, request: Any) -> tuple[Any, int, 
         scheduler.hypic_config,
         segment_boundaries=segment_boundaries,
     )
-    scheduler.hypic_catalog.touch_plan(plan)
     request.hypic_plan = plan
     return self.empty_kv_cache_blocks, int(plan["num_computed_tokens"]), 0
 
@@ -184,10 +200,38 @@ def _update_from_output(self: Scheduler, scheduler_output: Any, model_runner_out
     result = _ORIGINAL_UPDATE_FROM_OUTPUT(self, scheduler_output, model_runner_output)
     catalog = getattr(self, "hypic_catalog", None)
     if catalog is not None:
+        expected_evicted = [
+            segment["expected_eviction"]
+            for plan in plans
+            if plan is not None
+            for segment in plan["segments"]
+            if segment.get("expected_eviction") is not None
+        ]
         evicted: list[str] = []
         for plan in plans:
             if plan is not None:
                 evicted.extend(catalog.commit(plan))
+        if evicted != expected_evicted:
+            raise RuntimeError(
+                "HYPIC scheduler cache projection divergence: "
+                f"expected={expected_evicted}, actual={evicted}"
+            )
+        expected_order = next(
+            (
+                plan["cache_order_after_commit"]
+                for plan in reversed(plans)
+                if plan is not None and "cache_order_after_commit" in plan
+            ),
+            None,
+        )
+        if expected_order is not None and tuple(catalog.ready) != tuple(
+            expected_order
+        ):
+            raise RuntimeError(
+                "HYPIC scheduler cache order projection divergence: "
+                f"expected={tuple(expected_order)}, "
+                f"actual={tuple(catalog.ready)}"
+            )
         if evicted:
             logger.debug("HYPIC scheduler evicted %d segments", len(evicted))
     return result
