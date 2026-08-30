@@ -38,6 +38,8 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
 
 # isort: on
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import (
+    KVCacheStoreKeyLayerRecvingThread,
+    KVCacheStoreKeyLayerSendingThread,
     KVCacheStoreLayerRecvingThread,
     KVCacheStoreLayerSendingThread,
     KVCacheStoreRecvingThread,
@@ -88,6 +90,123 @@ class MaskedFakeTokenDatabase(FakeTokenDatabase):
             return True
         block_idx = start // self.get_block_size(kv_cache_group_id)
         return block_idx < len(masks[kv_cache_group_id]) and masks[kv_cache_group_id][block_idx]
+
+
+class HybridFakeTokenDatabase(ChunkedTokenDatabase):
+    def __init__(self):
+        metadata = [
+            KeyMetadata("dsv4", 0, 0, 0, 0, kv_cache_group_id=0),
+            KeyMetadata("dsv4", 0, 0, 0, 0, kv_cache_group_id=1),
+        ]
+        super().__init__(metadata, [16, 32], None, hash_block_size=16)
+        self.set_group_buffers(
+            {0: [1000, 2000], 1: [3000, 3500, 4000]},
+            {0: [160, 160], 1: [64, 32, 96]},
+            {0: [100, 100], 1: [200, 300, 400]},
+            group_num_layers={0: 2, 1: 2},
+            group_layer_cache_entry_offsets={0: [0, 1, 2], 1: [0, 2, 3]},
+        )
+
+
+class TestKeyLayerHybridTransfer(unittest.TestCase):
+    def _make_request(self):
+        return ReqMeta(
+            req_id="req",
+            token_len_chunk=32,
+            save_end_token=32,
+            block_ids_by_group=[[3, 4], [5]],
+            block_hashes=["h0", "h1"],
+            is_last_chunk=True,
+        )
+
+    def _make_tasks(self, request):
+        return [
+            LayerTransferTask(
+                layer_id=1,
+                group_id=0,
+                layer_idx_in_group=1,
+                block_ranges=[LayerBlockRange(request, 0, 2)],
+            ),
+            LayerTransferTask(
+                layer_id=1,
+                group_id=1,
+                layer_idx_in_group=0,
+                block_ranges=[LayerBlockRange(request, 0, 1)],
+            ),
+        ]
+
+    def test_save_batches_multiple_groups_with_group_local_layers(self):
+        store = FakeStore([0, 0, 0])
+        database = HybridFakeTokenDatabase()
+        save_events = [threading.Event(), threading.Event()]
+        sync_events = [MagicMock(), MagicMock()]
+        thread = KVCacheStoreKeyLayerSendingThread(
+            store,
+            database,
+            [16, 32],
+            tp_rank=0,
+            tp_size=1,
+            dcp_size=1,
+            put_step=4,
+            ready_event=threading.Event(),
+            num_layers=2,
+            layer_save_finished_events=save_events,
+            sync_save_events=sync_events,
+        )
+        thread.request_queue.task_done = MagicMock()
+        request = self._make_request()
+        tasks = self._make_tasks(request)
+        for task in tasks:
+            task.cached_process_tokens = thread.build_cached_process_tokens(task)
+            thread.add_stored_request(request.req_id)
+
+        thread._handle_request(tasks)
+
+        self.assertTrue(save_events[1].is_set())
+        sync_events[1].synchronize.assert_called_once()
+        self.assertEqual(len(store.put_calls), 1)
+        keys, addrs, sizes = store.put_calls[0]
+        self.assertEqual(len(keys), 3)
+        self.assertIn("@group:0@", keys[0])
+        self.assertIn("@layer_id:1@", keys[0])
+        self.assertIn("@group:1@", keys[2])
+        self.assertIn("@layer_id:0@", keys[2])
+        self.assertEqual(addrs, [[2300], [2400], [4000, 5000]])
+        self.assertEqual(sizes, [[160], [160], [64, 32]])
+
+    def test_load_batches_multiple_groups_with_group_local_layers(self):
+        store = FakeStore()
+        database = HybridFakeTokenDatabase()
+        load_events = [threading.Event(), threading.Event()]
+        thread = KVCacheStoreKeyLayerRecvingThread(
+            store,
+            database,
+            [16, 32],
+            tp_rank=0,
+            tp_size=1,
+            dcp_size=1,
+            ready_event=threading.Event(),
+            get_event=threading.Event(),
+            layer_load_finished_events=load_events,
+            layer_save_finished_events=[threading.Event(), threading.Event()],
+            num_layers=2,
+        )
+        thread.request_queue.task_done = MagicMock()
+        request = self._make_request()
+        tasks = self._make_tasks(request)
+
+        thread._handle_request(LayerLoadTask(None, tasks, layer_id=1))
+
+        self.assertTrue(load_events[1].is_set())
+        self.assertEqual(len(store.get_calls), 1)
+        keys, addrs, sizes = store.get_calls[0]
+        self.assertEqual(len(keys), 3)
+        self.assertIn("@group:0@", keys[0])
+        self.assertIn("@layer_id:1@", keys[0])
+        self.assertIn("@group:1@", keys[2])
+        self.assertIn("@layer_id:0@", keys[2])
+        self.assertEqual(addrs, [[2300], [2400], [4000, 5000]])
+        self.assertEqual(sizes, [[160], [160], [64, 32]])
 
 
 class TestLayerBatchBuilderOffsets(unittest.TestCase):

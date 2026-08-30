@@ -1082,6 +1082,37 @@ class TestKVPoolWorkerProcessLayerData(unittest.TestCase):
         self.assertEqual(first_task.write_finish_keys, [])
         self.assertEqual(last_task.write_finish_keys, ["k0"])
 
+    def test_build_shared_key_save_data_is_cached_per_group(self):
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import (
+            KVCacheStoreKeyLayerSendingThread,
+        )
+
+        worker = self._make_worker()
+        worker.num_layers = 2
+        worker.num_kv_cache_groups = 2
+        group0_layer0 = LayerTransferTask(layer_id=0, group_id=0, block_ranges=[])
+        group1_layer0 = LayerTransferTask(layer_id=0, group_id=1, block_ranges=[])
+        group0_layer1 = LayerTransferTask(layer_id=1, group_id=0, block_ranges=[])
+        group1_layer1 = LayerTransferTask(layer_id=1, group_id=1, block_ranges=[])
+        worker.layer_save_tasks = [
+            [group0_layer0, group1_layer0],
+            [group0_layer1, group1_layer1],
+        ]
+        send_thread = object.__new__(KVCacheStoreKeyLayerSendingThread)
+        group_caches = {0: {0: [(0, 16, ["g0"])]}, 1: {0: [(0, 32, ["g1"])]}}
+        send_thread.build_cached_process_tokens = MagicMock(
+            side_effect=lambda task: group_caches[task.group_id]
+        )
+        worker.kv_send_thread = send_thread
+
+        worker._build_shared_save_data()
+
+        self.assertIs(group0_layer0.cached_process_tokens, group_caches[0])
+        self.assertIs(group0_layer1.cached_process_tokens, group_caches[0])
+        self.assertIs(group1_layer0.cached_process_tokens, group_caches[1])
+        self.assertIs(group1_layer1.cached_process_tokens, group_caches[1])
+        self.assertEqual(send_thread.build_cached_process_tokens.call_count, 2)
+
     def test_process_save_for_layer_batch_skip_no_save(self):
         worker = self._make_worker()
         req = ReqMeta(req_id="r1", token_len_chunk=32, block_ids=[0, 1], block_hashes=["h0", "h1"], can_save=False)

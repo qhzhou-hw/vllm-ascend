@@ -464,22 +464,48 @@ class ChunkedTokenDatabase:
             size_list.append(size)
         return addr_list, size_list, block_id
 
-    def prepare_value_layer(self, start: int, end: int, block_ids: list[int], layer_id: int):
-        group_block_size = self.get_block_size(0)
+    def prepare_value_layer(
+        self,
+        start: int,
+        end: int,
+        block_ids: list[int],
+        layer_id: int,
+        kv_cache_group_id: int = 0,
+        cache_role: str = "kv",
+    ):
+        """Build the registered-buffer slices for one layer in one cache group.
+
+        ``layer_id`` is local to ``kv_cache_group_id``.  Keeping it group-local
+        is important for hybrid layouts such as DeepSeek-V4, where a physical
+        model layer can own entries in multiple KV cache groups and each group
+        has its own layer ordering and block size.
+        """
+        group_block_size = self.get_block_size(kv_cache_group_id)
         block_idx = start // group_block_size
         if block_idx >= len(block_ids):
             return [], [], 0
         block_id = block_ids[block_idx]
         addr_list: list[int] = []
         size_list: list[int] = []
-        group_addrs, group_block_len, group_block_stride = self._get_group_buffers(0)
-        num_layers = self.group_num_layers.get("kv", {}).get(0, 1)
-        entries_per_layer = len(group_addrs) // num_layers if num_layers else 0
-        if layer_id >= num_layers or entries_per_layer == 0:
+        group_addrs, group_block_len, group_block_stride = self._get_group_buffers(
+            kv_cache_group_id, cache_role
+        )
+        num_layers = self.group_num_layers.get(cache_role, {}).get(kv_cache_group_id, 1)
+        layer_offsets = self.group_layer_cache_entry_offsets.get(kv_cache_group_id)
+        if layer_id < 0 or layer_id >= num_layers:
             return [], [], 0
-        start_idx = layer_id * entries_per_layer
-        for i in range(entries_per_layer):
-            idx = start_idx + i
+
+        if layer_offsets is not None and len(layer_offsets) == num_layers + 1:
+            start_idx = layer_offsets[layer_id]
+            end_idx = layer_offsets[layer_id + 1]
+        else:
+            entries_per_layer = len(group_addrs) // num_layers if num_layers else 0
+            if entries_per_layer == 0:
+                return [], [], 0
+            start_idx = layer_id * entries_per_layer
+            end_idx = start_idx + entries_per_layer
+
+        for idx in range(start_idx, end_idx):
             block_stride = group_block_stride[idx] if group_block_stride else group_block_len[idx]
             addr = group_addrs[idx] + block_id * block_stride
             size = int(group_block_len[idx] / group_block_size * (end - start))

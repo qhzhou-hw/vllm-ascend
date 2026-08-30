@@ -78,8 +78,8 @@ Change `"kv_role"` to `"kv_producer"` or `"kv_consumer"` for PD disaggregation.
 
 | Parameter | Default | Description |
 | :--- | :--- | :--- |
-| `use_layerwise` | `false` | Enable layer-by-layer KV save/load. Requires `backend: "memcache"`. |
-| `backend` | `"mooncake"` | Storage backend. Layerwise currently supports `"memcache"` only. |
+| `use_layerwise` | `false` | Enable layer-by-layer KV save/load with the `memcache` or `mooncake` backend. |
+| `backend` | `"mooncake"` | Storage backend. Layerwise transfer supports `"memcache"` and `"mooncake"`; KV buffer reuse currently requires `"memcache"`. |
 | `mooncake_rpc_port` | `"0"` | RPC port for the scheduler↔worker lookup service. Use `"0"` to auto-assign, or a unique port per instance. |
 | `layerwise_prefetch_layers` | `1` | Number of layers to prefetch ahead of the compute frontier. Higher values improve overlap at the cost of memory. |
 | `layerwise_max_transfer_blocks` | `0` (unlimited) | Maximum number of KV blocks per transfer batch. |
@@ -232,11 +232,12 @@ wait/save calls. Layerwise + CP is future work.
 
 ## Limitations
 
-* **Backend**: Only `memcache` is supported for layerwise mode (`mooncake` and
-  `yuanrong` do not support `use_layerwise`).
-* **Hybrid KV cache**: Not supported — layerwise raises
-  `NotImplementedError` when the model has multiple KV cache group families
-  (hybrid MLA + sliding-window attention).
+* **Backend**: `memcache` and `mooncake` support layerwise save/load. Layerwise
+  KV buffer reuse (`layerwise_num_shared_buffers`) is available only with
+  `memcache`; `yuanrong` does not support `use_layerwise`.
+* **Hybrid KV cache**: DeepSeek-V4 attention cache groups are supported with
+  `memcache` and `mooncake`. Hybrid layouts containing non-attention state
+  caches, such as Mamba state, are not yet supported by layerwise transfer.
 * **Context parallel**: Layerwise is not yet integrated with CP attention
   backends.
 * **PD disaggregation proxy**: When using `kv_producer` / `kv_consumer`, the

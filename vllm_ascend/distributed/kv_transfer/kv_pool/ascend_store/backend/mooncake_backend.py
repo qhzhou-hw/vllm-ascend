@@ -194,6 +194,11 @@ class MooncakeBackend(Backend):
     def put(self, keys: list[str], addrs: list[list[int]], sizes: list[list[int]]):
         self.ensure_initialized()
         assert self.store is not None
+        logger.debug(
+            "MooncakeBackend.put enter keys=%d sample_keys=%s",
+            len(keys),
+            keys[:3],
+        )
         try:
             config = ReplicateConfig()
             if self.config.preferred_segment:

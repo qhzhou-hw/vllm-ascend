@@ -591,6 +591,36 @@ class TestKVPoolSchedulerGetStoreLookupHitTokens(unittest.TestCase):
                 result = scheduler._get_store_lookup_hit_tokens(request, 64, computed_tokens)
                 self.assertEqual(result, expected)
 
+    def test_hybrid_layerwise_uses_group_block_sizes_and_layer_counts(self):
+        scheduler = self._make_scheduler()
+        scheduler.use_layerwise = True
+        scheduler.use_hybrid = True
+        scheduler.kv_cache_group_ids = [0, 1]
+        scheduler.grouped_block_size = [16, 32]
+        scheduler.hash_block_size = 16
+        scheduler.cache_transfer_granularity = 32
+        scheduler.group_num_layers = [2, 1]
+        scheduler.store_scheduler.batch_is_exist.side_effect = [
+            [1, 1, 1, 1, 1, 1, 0, 0],
+            [1, 0],
+        ]
+        request = MagicMock(request_id="r1", block_hashes=[b"h0", b"h1", b"h2", b"h3"])
+
+        result = scheduler._get_store_lookup_hit_tokens(
+            request,
+            token_len=64,
+            num_computed_tokens=0,
+            include_layers=True,
+        )
+
+        self.assertEqual(result, 32)
+        group0_keys = scheduler.store_scheduler.batch_is_exist.call_args_list[0].args[0]
+        group1_keys = scheduler.store_scheduler.batch_is_exist.call_args_list[1].args[0]
+        self.assertEqual(len(group0_keys), 8)
+        self.assertEqual(len(group1_keys), 2)
+        self.assertTrue(all("@group:0@" in key for key in group0_keys))
+        self.assertTrue(all("@group:1@" in key for key in group1_keys))
+
 
 class TestKVPoolSchedulerFloorGranularity(unittest.TestCase):
     """Test _floor_to_cache_transfer_granularity."""

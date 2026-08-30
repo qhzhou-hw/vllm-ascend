@@ -1084,11 +1084,17 @@ class AscendDSAImpl(AttentionImplBase[Any]):
         pass
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
-        # Attention impls are not walked by vllm's process_weights_after_loading
-        # dispatcher (only LinearMethodBase subclasses are). OTP buffers are
-        # allocated lazily on the first _forward_o_proj call, which always runs
-        # before ACL graph capture (profiling run triggers it).
-        pass
+        del act_dtype
+        # Real checkpoints reshape wo_a in AscendColumnParallelLinear's weight
+        # loader. DummyModelLoader initializes the parameter directly and skips
+        # that loader, so normalize the untouched 2-D weight here as well. The
+        # post-load hook is also used by normal and online-reload flows; their
+        # already packed 3-D weights must remain unchanged.
+        if get_ascend_device_type() in {AscendDeviceType.A5} or self.wo_a.weight.ndim != 2:
+            return
+        self.wo_a.weight.data = (
+            self.wo_a.weight.data.view(self.n_local_groups, self.o_lora_rank, -1).transpose(2, 1).contiguous()
+        )
 
     def _forward_o_proj(self, o_proj_input: torch.Tensor, output: torch.Tensor) -> torch.Tensor:
         num_tokens = o_proj_input.shape[0]

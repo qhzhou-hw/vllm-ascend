@@ -4043,10 +4043,23 @@ class NPUModelRunner(GPUModelRunner):
                     layer_kv_cache_spec[layer_name] = group_spec.kv_cache_specs[layer_name]
                 else:
                     layer_kv_cache_spec[layer_name] = group_spec
-                if static_forward_context is not None:
+                # Prefer the per-layer spec generated before the scheduler
+                # normalizes the global block size for hybrid cache groups.
+                # Recomputing an indexer spec after that normalization can feed
+                # a compressed scheduler block size (for example, 2) back into
+                # DeepSeek-V4's physical-page lookup, which only accepts the
+                # configured 32/64/128-token page sizes.
+                if static_forward_context is not None and not isinstance(
+                    layer_kv_cache_spec[layer_name], AscendSFAIndexerCacheSpec
+                ):
                     attn_layer = static_forward_context.get(layer_name)
                     if isinstance(attn_layer, AttentionLayerBase):
-                        spec = attn_layer.get_kv_cache_spec(self.vllm_config)
+                        spec_config = copy(self.vllm_config)
+                        spec_config.cache_config = copy(
+                            self.vllm_config.cache_config
+                        )
+                        spec_config.cache_config.block_size = self.block_size
+                        spec = attn_layer.get_kv_cache_spec(spec_config)
                         if isinstance(spec, AscendSFAIndexerCacheSpec):
                             layer_kv_cache_spec[layer_name] = spec
         return layer_kv_cache_spec

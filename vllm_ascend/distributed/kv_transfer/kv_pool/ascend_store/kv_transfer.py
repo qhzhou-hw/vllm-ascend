@@ -338,6 +338,9 @@ class KVTransferThread(threading.Thread):
             return self.block_size[kv_cache_group_id]
         return self.block_size
 
+    def _get_group_num_layers(self, kv_cache_group_id: int, default: int) -> int:
+        return self.token_database.group_num_layers.get("kv", {}).get(kv_cache_group_id, default)
+
     def add_request(self, request: Any) -> None:
         self.request_queue.put(request)
 
@@ -1017,7 +1020,7 @@ class KVCacheStoreKeyLayerSendingThread(KVTransferThread):
         self,
         m_store: Backend,
         token_database: ChunkedTokenDatabase,
-        block_size: int,
+        block_size: int | list[int],
         tp_rank: int,
         tp_size: int,
         dcp_size: int,
@@ -1052,7 +1055,9 @@ class KVCacheStoreKeyLayerSendingThread(KVTransferThread):
         if not task.block_ranges:
             return None
 
-        group_block_size = self._get_block_size(0)
+        group_id = task.group_id
+        group_block_size = self._get_block_size(group_id)
+        group_num_layers = self._get_group_num_layers(group_id, self.final_layer_id + 1)
         cache: dict[int, list[tuple[int, int, list]]] = {}
 
         for br_idx, block_range in enumerate(task.block_ranges):
@@ -1063,11 +1068,12 @@ class KVCacheStoreKeyLayerSendingThread(KVTransferThread):
                 request.save_end_token,
                 request.block_hashes,
                 mask_num,
+                kv_cache_group_id=group_id,
             ):
                 block_index = start // group_block_size
                 if block_index < block_range.start_block or block_index >= block_range.end_block:
                     continue
-                key_all = key.split_layers(self.final_layer_id + 1)
+                key_all = key.split_layers(group_num_layers)
                 entries.append((start, end, key_all))
             cache[br_idx] = entries
 
@@ -1079,67 +1085,75 @@ class KVCacheStoreKeyLayerSendingThread(KVTransferThread):
         if len(transfer_tasks) == 0:
             self.request_queue.task_done()
             return
-        if len(transfer_tasks) > 1:
-            raise ValueError(f"Expected at most one layer transfer task, got {len(transfer_tasks)}")
-
-        transfer_task = transfer_tasks[0]
-        layer_id = transfer_task.layer_id
+        layer_ids = {task.layer_id for task in transfer_tasks}
+        if len(layer_ids) != 1:
+            raise ValueError(f"Expected transfer tasks for one physical layer, got layer_ids={sorted(layer_ids)}")
+        layer_id = transfer_tasks[0].layer_id
         key_list = []
         addr_list = []
         size_list = []
         req_ids = []
         is_last_chunks = []
 
-        # Reuse pre-computed process_tokens results if available
-        cached_tokens = transfer_task.cached_process_tokens
-
-        for br_idx, block_range in enumerate(transfer_task.block_ranges):
-            request = block_range.request
-            req_ids.append(request.req_id)
-            is_last_chunks.append(request.is_last_chunk)
-            starts = []
-            ends = []
-            keys = []
-            group_block_size = self._get_block_size(0)
-
-            if cached_tokens is not None:
-                # Fast path: reuse cached (start, end, key_all) tuples
-                for start, end, key_all in cached_tokens[br_idx]:
-                    block_index = start // group_block_size
-                    if block_index < block_range.start_block or block_index >= block_range.end_block:
-                        continue
-                    starts.append(start)
-                    ends.append(end)
-                    keys.append(key_all[layer_id])
-            else:
-                mask_num = request.save_start_token // group_block_size * group_block_size
-                for start, end, key in self.token_database.process_tokens(
-                    request.save_end_token,
-                    request.block_hashes,
-                    mask_num,
-                ):
-                    block_index = start // group_block_size
-                    if block_index < block_range.start_block or block_index >= block_range.end_block:
-                        continue
-                    starts.append(start)
-                    ends.append(end)
-                    keys.append(key.split_layers(self.final_layer_id + 1)[layer_id])
-
-            if not self.dcp_size > 1:
-                starts = starts[self.tp_rank % self.put_step :: self.put_step]
-                ends = ends[self.tp_rank % self.put_step :: self.put_step]
-                keys = keys[self.tp_rank % self.put_step :: self.put_step]
-
-            for index, key in enumerate(keys):
-                key_list.append(key.to_string())
-                addr, size, _ = self.token_database.prepare_value_layer(
-                    starts[index],
-                    ends[index],
-                    request.block_ids,
-                    layer_id,
+        for transfer_task in transfer_tasks:
+            group_id = transfer_task.group_id
+            layer_idx_in_group = transfer_task.layer_idx_in_group
+            group_block_size = self._get_block_size(group_id)
+            group_num_layers = self._get_group_num_layers(group_id, self.final_layer_id + 1)
+            if layer_idx_in_group >= group_num_layers:
+                raise ValueError(
+                    f"Layer index {layer_idx_in_group} is out of range for KV cache group "
+                    f"{group_id} with {group_num_layers} layers"
                 )
-                addr_list.append(addr)
-                size_list.append(size)
+
+            # Reuse the group-specific process_tokens results when available.
+            cached_tokens = transfer_task.cached_process_tokens
+            for br_idx, block_range in enumerate(transfer_task.block_ranges):
+                request = block_range.request
+                req_ids.append(request.req_id)
+                is_last_chunks.append(request.is_last_chunk)
+                starts = []
+                ends = []
+                keys = []
+
+                if cached_tokens is not None:
+                    for start, end, key_all in cached_tokens.get(br_idx, []):
+                        block_index = start // group_block_size
+                        if block_index < block_range.start_block or block_index >= block_range.end_block:
+                            continue
+                        starts.append(start)
+                        ends.append(end)
+                        keys.append(key_all[layer_idx_in_group])
+                else:
+                    mask_num = request.save_start_token // group_block_size * group_block_size
+                    for start, end, key in self.token_database.process_tokens(
+                        request.save_end_token,
+                        request.block_hashes,
+                        mask_num,
+                        kv_cache_group_id=group_id,
+                    ):
+                        block_index = start // group_block_size
+                        if block_index < block_range.start_block or block_index >= block_range.end_block:
+                            continue
+                        starts.append(start)
+                        ends.append(end)
+                        keys.append(key.split_layers(group_num_layers)[layer_idx_in_group])
+
+                # KVPoolWorker creates layerwise save tasks only on the first
+                # rank in each put_step group. That rank must publish every
+                # block; sharding here would silently drop the other blocks.
+                block_ids = request.block_ids_by_group[group_id]
+                for index, key in enumerate(keys):
+                    key_list.append(key.to_string())
+                    addr, size, _ = self.token_database.prepare_value_layer(
+                        starts[index],
+                        ends[index],
+                        block_ids,
+                        layer_idx_in_group,
+                        kv_cache_group_id=group_id,
+                    )
+                    addr_list.append(addr)
+                    size_list.append(size)
 
         for req_id in req_ids:
             self.dec_stored_request(req_id)
@@ -1171,7 +1185,7 @@ class KVCacheStoreKeyLayerRecvingThread(KVTransferThread):
         self,
         m_store: Backend,
         token_database: ChunkedTokenDatabase,
-        block_size: int,
+        block_size: int | list[int],
         tp_rank: int,
         tp_size: int,
         dcp_size: int,
@@ -1219,30 +1233,43 @@ class KVCacheStoreKeyLayerRecvingThread(KVTransferThread):
         size_list = []
         req_ids = []
         is_last_chunks = []
-        if len(data.transfer_tasks) > 1:
-            raise ValueError(f"Expected at most one layer transfer task, got {len(data.transfer_tasks)}")
-        if data.transfer_tasks:
-            transfer_task = data.transfer_tasks[0]
+        for transfer_task in data.transfer_tasks:
+            group_id = transfer_task.group_id
+            layer_idx_in_group = transfer_task.layer_idx_in_group
+            group_block_size = self._get_block_size(group_id)
+            group_num_layers = self._get_group_num_layers(group_id, self.final_layer_id + 1)
+            if layer_idx_in_group >= group_num_layers:
+                raise ValueError(
+                    f"Layer index {layer_idx_in_group} is out of range for KV cache group "
+                    f"{group_id} with {group_num_layers} layers"
+                )
             for block_range in transfer_task.block_ranges:
                 request = block_range.request
                 req_ids.append(request.req_id)
                 is_last_chunks.append(request.is_last_chunk)
+                group_block_hashes = get_block_hashes(
+                    request.block_hashes,
+                    group_block_size,
+                    getattr(self.token_database, "hash_block_size", group_block_size),
+                )
+                block_ids = request.block_ids_by_group[group_id]
                 for block_index in range(block_range.start_block, block_range.end_block):
-                    if block_index >= len(request.block_hashes):
+                    if block_index >= len(group_block_hashes):
                         continue
-                    block_hash = request.block_hashes[block_index]
+                    block_hash = group_block_hashes[block_index]
                     chunk_hash = block_hash if isinstance(block_hash, str) else block_hash.hex()
                     key = self.token_database._make_key_by_hash(
                         chunk_hash,
-                    ).split_layers(self.final_layer_id + 1)[layer_id]
-                    group_block_size = self._get_block_size(0)
+                        kv_cache_group_id=group_id,
+                    ).split_layers(group_num_layers)[layer_idx_in_group]
                     start = block_index * group_block_size
                     end = start + group_block_size
                     addr, size, _ = self.token_database.prepare_value_layer(
                         start,
                         end,
-                        request.block_ids,
-                        layer_id,
+                        block_ids,
+                        layer_idx_in_group,
+                        kv_cache_group_id=group_id,
                     )
                     key_list.append(key.to_string())
                     addr_list.append(addr)

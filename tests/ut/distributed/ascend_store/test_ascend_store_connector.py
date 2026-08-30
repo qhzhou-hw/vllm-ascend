@@ -377,6 +377,8 @@ class TestAscendStoreConnectorLayerwise(unittest.TestCase):
                 role=KVConnectorRole.WORKER,
                 kv_cache_config=None,
             )
+            self.assertFalse(connector.use_gva_layerwise)
+            self.assertFalse(connector.set_external_slot_release_waiter(MagicMock()))
             connector.wait_for_save()
             mock_worker_cls.return_value.wait_for_save.assert_not_called()
             connector._get_connector_metadata = MagicMock(return_value=MagicMock())

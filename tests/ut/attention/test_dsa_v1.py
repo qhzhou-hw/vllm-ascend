@@ -41,6 +41,7 @@ from vllm_ascend.models.deepseek_v4.indexer import (
     AscendIndexerMetadata,
     IndexerOverlapPlan,
 )
+from vllm_ascend.utils import AscendDeviceType
 from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
 
 
@@ -85,6 +86,28 @@ def _make_builder(compressor_ratio: int = 4) -> AscendDSAMetadataBuilder:
     builder.seq_lens = torch.tensor([8, 6], dtype=torch.int32)
     builder.num_decodes = 2
     return builder
+
+
+def test_process_weights_after_loading_packs_dummy_wo_a() -> None:
+    impl = AscendDSAImpl.__new__(AscendDSAImpl)
+    impl.n_local_groups = 2
+    impl.o_lora_rank = 3
+    original = torch.arange(24, dtype=torch.float32).reshape(6, 4)
+    impl.wo_a = SimpleNamespace(weight=torch.nn.Parameter(original.clone()))
+    expected = original.view(2, 3, 4).transpose(2, 1).contiguous()
+
+    with patch(
+        "vllm_ascend.attention.dsa_v1.get_ascend_device_type",
+        return_value=AscendDeviceType.A2,
+    ):
+        impl.process_weights_after_loading(torch.bfloat16)
+        assert torch.equal(impl.wo_a.weight, expected)
+        assert impl.wo_a.weight.shape == (2, 4, 3)
+
+        # Normal checkpoint loads and repeat post-load calls already expose the
+        # packed layout and must not transpose the weight a second time.
+        impl.process_weights_after_loading(torch.bfloat16)
+        assert torch.equal(impl.wo_a.weight, expected)
 
 
 @pytest.mark.parametrize(

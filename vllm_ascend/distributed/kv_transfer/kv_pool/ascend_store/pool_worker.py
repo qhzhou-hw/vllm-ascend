@@ -495,7 +495,7 @@ class KVPoolWorker:
                 self.kv_send_thread = KVCacheStoreKeyLayerSendingThread(
                     self.m_store,
                     self.token_database,
-                    self.block_size,
+                    self.grouped_block_size,
                     self.tp_rank,
                     self.tp_size,
                     self.dcp_size,
@@ -536,7 +536,7 @@ class KVPoolWorker:
                 self.kv_recv_thread = KVCacheStoreKeyLayerRecvingThread(
                     self.m_store,
                     self.token_database,
-                    self.block_size,
+                    self.grouped_block_size,
                     self.tp_rank,
                     self.tp_size,
                     self.dcp_size,
@@ -1555,18 +1555,23 @@ class KVPoolWorker:
             if last_task is not None:
                 last_task.write_finish_keys.extend(dict.fromkeys(all_save_keys))
         elif isinstance(self.kv_send_thread, KVCacheStoreKeyLayerSendingThread):
-            first_task = None
-            for layer_id in range(self.num_layers):
-                if self.layer_save_tasks[layer_id]:
-                    first_task = self.layer_save_tasks[layer_id][0]
-                    break
-            if first_task is None:
-                return
-            cached = self.kv_send_thread.build_cached_process_tokens(first_task)
-            if cached is not None:
+            for group_id in range(self.num_kv_cache_groups):
+                first_task = None
                 for layer_id in range(self.num_layers):
                     for task in self.layer_save_tasks[layer_id]:
-                        task.cached_process_tokens = cached
+                        if task.group_id == group_id:
+                            first_task = task
+                            break
+                    if first_task is not None:
+                        break
+                if first_task is None:
+                    continue
+                cached = self.kv_send_thread.build_cached_process_tokens(first_task)
+                if cached is not None:
+                    for layer_id in range(self.num_layers):
+                        for task in self.layer_save_tasks[layer_id]:
+                            if task.group_id == group_id:
+                                task.cached_process_tokens = cached
 
     def _build_shared_load_data(self) -> None:
         """Build shared block data once and attach to all layer load tasks.
@@ -2070,10 +2075,11 @@ class KVPoolWorker:
         starts: list[int] = []
         ends: list[int] = []
         if use_layerwise:
+            group_num_layers = getattr(self, "group_num_layers", {}).get(group_id, self.num_layers)
             for start, end, pool_key in self.token_database.process_tokens(
                 token_len, block_hashes, kv_cache_group_id=group_id
             ):
-                keys.extend(item.to_string() for item in pool_key.split_layers(self.num_layers))
+                keys.extend(item.to_string() for item in pool_key.split_layers(group_num_layers))
                 starts.append(start)
                 ends.append(end)
         else:
@@ -2119,7 +2125,8 @@ class KVPoolWorker:
                 res = self.m_store.exists(keys)  # type: ignore[assignment]
 
                 if use_layerwise:
-                    res = self.check_all_layers_exists(res, self.num_layers)
+                    group_num_layers = getattr(self, "group_num_layers", {}).get(group_id, self.num_layers)
+                    res = self.check_all_layers_exists(res, group_num_layers)
                 if group_id < len(self.group_uses_align_state) and self.group_uses_align_state[group_id]:
                     hit_end = 0
                     for index in range(len(ends) - 1, -1, -1):
@@ -2318,8 +2325,9 @@ class KVPoolWorker:
                 res = self.m_store.exists(multi_tp_keys)  # type: ignore[assignment]
                 num_block = len(keys)
                 if use_layerwise:
-                    res = self.check_all_layers_exists(res, self.num_layers)
-                    num_block = len(keys) // self.num_layers
+                    group_num_layers = getattr(self, "group_num_layers", {}).get(group_id, self.num_layers)
+                    res = self.check_all_layers_exists(res, group_num_layers)
+                    num_block = len(keys) // group_num_layers
                 multi_tp_values = [
                     res[i * num_block : (i + 1) * num_block]  # type: ignore[index]
                     for i in range(num_ranks)

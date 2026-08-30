@@ -7,6 +7,7 @@ import numpy as np
 import torch
 from vllm.config import CUDAGraphMode
 from vllm.model_executor.layers.attention import MLAAttention
+from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
 from vllm.sampling_params import SamplingParams
 from vllm.v1.attention.backends.utils import reorder_batch_to_split_decodes_and_prefills
@@ -236,6 +237,93 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
         )
         runner.attn_backend = backend
         return runner
+
+    def test_layer_specs_preserve_indexer_after_hybrid_block_normalization(self):
+        runner = self._build_runner()
+        layer_name = "model.layers.0.self_attn.indexer.k_cache"
+        indexer_spec = AscendSFAIndexerCacheSpec(
+            block_size=32,
+            num_kv_heads=1,
+            head_size=128,
+            dtype=torch.bfloat16,
+        )
+        group_spec = UniformTypeKVCacheSpecs.from_specs({layer_name: indexer_spec})
+        self.assertIsNotNone(group_spec)
+        assert group_spec is not None
+
+        indexer_layer = MagicMock(spec=AttentionLayerBase)
+        indexer_layer.get_kv_cache_spec.side_effect = AssertionError(
+            "the scheduler-normalized global block size must not be reused"
+        )
+        runner.compilation_config = SimpleNamespace(static_forward_context={layer_name: indexer_layer})
+        runner.vllm_config.cache_config.block_size = 2
+        kv_cache_config = KVCacheConfig(
+            num_blocks=1,
+            kv_cache_tensors=[
+                KVCacheTensor(
+                    size=indexer_spec.page_size_bytes,
+                    shared_by=[layer_name],
+                )
+            ],
+            kv_cache_groups=[
+                KVCacheGroupSpec(
+                    layer_names=[layer_name],
+                    kv_cache_spec=group_spec,
+                )
+            ],
+        )
+
+        layer_specs = runner._get_layer_kv_cache_specs(kv_cache_config)
+
+        self.assertIs(layer_specs[layer_name], indexer_spec)
+        indexer_layer.get_kv_cache_spec.assert_not_called()
+
+    def test_layer_specs_rebuild_indexer_with_physical_block_size(self):
+        runner = self._build_runner()
+        runner.block_size = 32
+        runner.vllm_config.cache_config.block_size = 2
+        layer_name = "model.layers.0.self_attn.indexer.k_cache"
+        normalized_spec = FullAttentionSpec(
+            block_size=2,
+            num_kv_heads=1,
+            head_size=128,
+            dtype=torch.bfloat16,
+        )
+        indexer_spec = AscendSFAIndexerCacheSpec(
+            block_size=32,
+            num_kv_heads=1,
+            head_size=128,
+            dtype=torch.bfloat16,
+        )
+        indexer_layer = MagicMock(spec=AttentionLayerBase)
+
+        def get_indexer_spec(vllm_config):
+            self.assertEqual(vllm_config.cache_config.block_size, 32)
+            return indexer_spec
+
+        indexer_layer.get_kv_cache_spec.side_effect = get_indexer_spec
+        runner.compilation_config = SimpleNamespace(static_forward_context={layer_name: indexer_layer})
+        kv_cache_config = KVCacheConfig(
+            num_blocks=1,
+            kv_cache_tensors=[
+                KVCacheTensor(
+                    size=normalized_spec.page_size_bytes,
+                    shared_by=[layer_name],
+                )
+            ],
+            kv_cache_groups=[
+                KVCacheGroupSpec(
+                    layer_names=[layer_name],
+                    kv_cache_spec=normalized_spec,
+                )
+            ],
+        )
+
+        layer_specs = runner._get_layer_kv_cache_specs(kv_cache_config)
+
+        self.assertIs(layer_specs[layer_name], indexer_spec)
+        self.assertEqual(runner.vllm_config.cache_config.block_size, 2)
+        indexer_layer.get_kv_cache_spec.assert_called_once()
 
     def test_allocate_kv_cache_uses_layer_spec_for_draft_gqa(self):
         runner = self._build_runner()
