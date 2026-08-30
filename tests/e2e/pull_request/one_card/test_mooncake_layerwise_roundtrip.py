@@ -167,10 +167,7 @@ def test_mooncake_hybrid_layerwise_kv_roundtrip(mooncake_store_config: Path) -> 
         1: [_new_cache(32, 6), _new_cache(32, 4), _new_cache(32, 5)],
     }
     torch.npu.synchronize()
-    originals = {
-        group_id: [tensor.cpu().clone() for tensor in tensors]
-        for group_id, tensors in group_caches.items()
-    }
+    originals = {group_id: [tensor.cpu().clone() for tensor in tensors] for group_id, tensors in group_caches.items()}
 
     test_namespace = f"dsv4-layerwise-roundtrip-{uuid.uuid4().hex}"
     database = ChunkedTokenDatabase(
@@ -183,12 +180,10 @@ def test_mooncake_hybrid_layerwise_kv_roundtrip(mooncake_store_config: Path) -> 
         hash_block_size=_HASH_BLOCK_SIZE,
     )
     group_base_addrs = {
-        group_id: [tensor.data_ptr() for tensor in tensors]
-        for group_id, tensors in group_caches.items()
+        group_id: [tensor.data_ptr() for tensor in tensors] for group_id, tensors in group_caches.items()
     }
     group_block_lengths = {
-        group_id: [_block_bytes(tensor) for tensor in tensors]
-        for group_id, tensors in group_caches.items()
+        group_id: [_block_bytes(tensor) for tensor in tensors] for group_id, tensors in group_caches.items()
     }
     database.set_group_buffers(
         group_base_addrs,
@@ -215,17 +210,13 @@ def test_mooncake_hybrid_layerwise_kv_roundtrip(mooncake_store_config: Path) -> 
     real_put = backend.put
     real_get = backend.get
 
-    def counted_put(
-        keys: list[str], addrs: list[list[int]], sizes: list[list[int]]
-    ) -> None:
+    def counted_put(keys: list[str], addrs: list[list[int]], sizes: list[list[int]]) -> None:
         io_stats["put_calls"] += 1
         io_stats["put_keys"] += len(keys)
         io_stats["put_bytes"] += sum(sum(key_sizes) for key_sizes in sizes)
         real_put(keys, addrs, sizes)
 
-    def counted_get(
-        keys: list[str], addrs: list[list[int]], sizes: list[list[int]]
-    ) -> list[int] | None:
+    def counted_get(keys: list[str], addrs: list[list[int]], sizes: list[list[int]]) -> list[int] | None:
         io_stats["get_calls"] += 1
         io_stats["get_keys"] += len(keys)
         io_stats["get_bytes"] += sum(sum(key_sizes) for key_sizes in sizes)
@@ -343,3 +334,114 @@ def test_mooncake_hybrid_layerwise_kv_roundtrip(mooncake_store_config: Path) -> 
             sort_keys=True,
         )
     )
+
+
+def test_mooncake_aligned_mamba_state_roundtrip(mooncake_store_config: Path) -> None:
+    del mooncake_store_config
+    torch.npu.set_device(0)
+    torch.manual_seed(20260830)
+
+    block_size = 32
+    conv_state = _new_cache(block_size, 4)
+    ssm_state = _new_cache(block_size, 7)
+    states = [conv_state, ssm_state]
+    torch.npu.synchronize()
+    originals = [state.cpu().clone() for state in states]
+
+    database = ChunkedTokenDatabase(
+        [KeyMetadata(f"qwen35-mamba-{uuid.uuid4().hex}", 0, 0, 0, 0)],
+        [block_size],
+        partitions=None,
+        hash_block_size=_HASH_BLOCK_SIZE,
+    )
+    state_block_lengths = [_block_bytes(state) for state in states]
+    database.set_group_buffers(
+        {0: [state.data_ptr() for state in states]},
+        {0: state_block_lengths},
+        group_block_stride={0: state_block_lengths},
+        group_num_layers={0: 1},
+        group_layer_cache_entry_offsets={0: [0, 2]},
+    )
+
+    backend = MooncakeBackend(ParallelConfig())
+    backend.register_buffer(
+        [state.data_ptr() for state in states],
+        [state.numel() * state.element_size() for state in states],
+    )
+    request = ReqMeta(
+        req_id="qwen35-mamba-roundtrip",
+        token_len_chunk=64,
+        save_end_token=64,
+        block_ids_by_group=[[0, 2]],
+        block_hashes=["mamba-h0", "mamba-h1", "mamba-h2", "mamba-h3"],
+        is_last_chunk=True,
+        skip_null_blocks_by_group=[True],
+    )
+
+    def make_task() -> LayerTransferTask:
+        return LayerTransferTask(
+            layer_id=0,
+            group_id=0,
+            layer_idx_in_group=0,
+            block_ranges=[LayerBlockRange(request, 0, 2)],
+        )
+
+    save_event = threading.Event()
+    sync_event = torch.npu.Event()
+    sync_event.record()
+    sender = KVCacheStoreKeyLayerSendingThread(
+        backend,
+        database,
+        [block_size],
+        tp_rank=0,
+        tp_size=1,
+        dcp_size=1,
+        put_step=1,
+        ready_event=threading.Event(),
+        num_layers=1,
+        layer_save_finished_events=[save_event],
+        sync_save_events=[sync_event],
+    )
+    save_task = make_task()
+    save_task.cached_process_tokens = sender.build_cached_process_tokens(save_task)
+    sender.add_stored_request(request.req_id)
+    sender.request_queue.put([save_task])
+    sender._handle_request([save_task])
+
+    all_keys = []
+    for _, _, key in database.process_tokens(
+        request.save_end_token,
+        request.block_hashes,
+    ):
+        all_keys.append(key.split_layers(1)[0].to_string())
+    exists = backend.exists(all_keys)
+    assert exists == [0, 1], "only the live aligned Mamba state must be stored"
+
+    for state in states:
+        state.fill_(_SENTINEL)
+    torch.npu.synchronize()
+
+    receiver = KVCacheStoreKeyLayerRecvingThread(
+        backend,
+        database,
+        [block_size],
+        tp_rank=0,
+        tp_size=1,
+        dcp_size=1,
+        ready_event=threading.Event(),
+        get_event=threading.Event(),
+        layer_load_finished_events=[threading.Event()],
+        layer_save_finished_events=[threading.Event()],
+        num_layers=1,
+    )
+    load_task = LayerLoadTask(None, [make_task()], layer_id=0)
+    receiver.request_queue.put(load_task)
+    receiver._handle_request(load_task)
+    torch.npu.synchronize()
+
+    for actual, expected in zip(states, originals):
+        actual_cpu = actual.cpu()
+        assert torch.all(actual_cpu[0] == _SENTINEL)
+        assert torch.equal(actual_cpu[2], expected[2])
+        assert torch.all(actual_cpu[1] == _SENTINEL)
+        assert torch.all(actual_cpu[3] == _SENTINEL)

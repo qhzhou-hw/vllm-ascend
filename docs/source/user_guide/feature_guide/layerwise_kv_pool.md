@@ -227,12 +227,12 @@ contend on the PCIe/HCCS bus. Set `h2d_stagger_us` to spread them out (e.g.
 
 ## Supported Models
 
-Layerwise mode integrates with the **MLA** (`mla_v1`) and **SFA** (`sfa_v1`)
-attention backends. DeepSeek-V2/V3 and other MLA-based models are supported.
+Layerwise mode integrates with **MLA** (`mla_v1`), **SFA** (`sfa_v1`),
+standard Full Attention, and Qwen GDN. DeepSeek-V2/V3/V4, Qwen3 Dense, and
+Qwen3.5 hybrid models are covered by the corresponding Mooncake paths.
 
-Basic full attention (`attention_v1`) and all context-parallel (CP) variants
-(`mla_cp`, `sfa_cp`, `attention_cp`) do **not** yet integrate the layerwise
-wait/save calls. Layerwise + CP is future work.
+Context-parallel (CP) variants (`mla_cp`, `sfa_cp`, `attention_cp`) do **not**
+yet provide uniform layerwise integration. Layerwise + CP is future work.
 
 ## Limitations
 
@@ -240,8 +240,9 @@ wait/save calls. Layerwise + CP is future work.
   KV buffer reuse (`layerwise_num_shared_buffers`) is available only with
   `memcache`; `yuanrong` does not support `use_layerwise`.
 * **Hybrid KV cache**: DeepSeek-V4 attention cache groups are supported with
-  `memcache` and `mooncake`. Hybrid layouts containing non-attention state
-  caches, such as Mamba state, are not yet supported by layerwise transfer.
+  `memcache` and `mooncake`. Mooncake additionally supports Qwen3.5 GDN
+  conv/SSM state with `mamba_cache_mode=align`; other state modes and model
+  families require separate validation.
 * **Context parallel**: Layerwise is not yet integrated with CP attention
   backends.
 * **PD disaggregation proxy**: When using `kv_producer` / `kv_consumer`, the

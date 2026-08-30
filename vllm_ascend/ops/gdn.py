@@ -28,7 +28,10 @@ from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata  # typ
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
-from vllm_ascend.attention.utils import maybe_save_kv_layer_to_connector
+from vllm_ascend.attention.utils import (
+    maybe_save_kv_layer_to_connector,
+    wait_for_kv_layer_from_connector,
+)
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.ops.gdn_attn_builder import AscendGDNAttentionBackend
 from vllm_ascend.ops.triton.fla.chunk import chunk_gated_delta_rule
@@ -276,6 +279,10 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         assert isinstance(attn_metadata, dict)
         attn_metadata = attn_metadata[self.prefix]
         assert isinstance(attn_metadata, GDNAttentionMetadata)
+        # GDN reads and updates recurrent conv/SSM state in place.  Keep the
+        # same layerwise load-before-compute ordering as paged attention so an
+        # externally restored prefix state is visible to the first GDN kernel.
+        wait_for_kv_layer_from_connector(self.prefix)
         spec_sequence_masks = attn_metadata.spec_sequence_masks
         spec_token_indx = attn_metadata.spec_token_indx
         non_spec_token_indx = attn_metadata.non_spec_token_indx
@@ -590,4 +597,6 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)
         else:
             core_attn_out[:num_actual_tokens] = core_attn_out_non_spec.squeeze(0)
-        maybe_save_kv_layer_to_connector("", [])
+        # The connector owns the registered cache addresses; this callback is
+        # the per-layer readiness signal after both recurrent states changed.
+        maybe_save_kv_layer_to_connector(self.prefix, [])

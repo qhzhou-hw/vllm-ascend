@@ -42,9 +42,8 @@ for deployment parameters and the
 [design document](../../developer_guide/Design_Documents/mooncake_layerwise_ascend_store_connector.md)
 for implementation and verification details.
 
-This support statement does not include Qwen3-Next or Qwen3.5 hybrid
-GDN/Mamba models. Their state cache requires a separate layerwise persistence
-implementation.
+Qwen3.5 hybrid GDN/Mamba models use the aligned-state extension of the same
+Mooncake path and are validated separately; see the linked design document.
 
 ## 3 Prerequisites
 

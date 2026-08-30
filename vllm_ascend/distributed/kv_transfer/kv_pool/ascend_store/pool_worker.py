@@ -833,6 +833,11 @@ class KVPoolWorker:
         if len(metadata.requests) == 0:
             return
         if self.use_layerwise:
+            for request in metadata.requests:
+                # Mamba align groups expose sparse logical block tables whose
+                # unused entries reference block 0.  Pass this layout contract
+                # to the layer threads so only live recurrent state is moved.
+                request.skip_null_blocks_by_group = self.group_uses_align_state
             self.process_layer_data(metadata.requests)
             return
         for request in metadata.requests:
@@ -1050,9 +1055,15 @@ class KVPoolWorker:
                 block_size,
                 self.hash_block_size,
             )
+            # Key-based layerwise backends (Mooncake) must restore the full
+            # externally verified prefix even when vLLM reports a local
+            # prefix-cache hit.  Hybrid align-mode state may share the same
+            # logical hit count while its per-layer state is only available
+            # in the external store.  GVA buffer reuse keeps its existing
+            # optimization for independent, HBM-resident layers.
             load_start_block = (
                 request.load_spec.vllm_cached_tokens // block_size
-                if not self.layerwise_offload or layer_id in self.independent_layers
+                if self.use_gva_layerwise and (not self.layerwise_offload or layer_id in self.independent_layers)
                 else 0
             )
             cached_full_blocks = cached_tokens // block_size

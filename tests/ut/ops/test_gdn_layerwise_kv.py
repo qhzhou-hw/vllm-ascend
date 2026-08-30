@@ -143,13 +143,20 @@ def test_connector_observes_updated_gdn_state_for_each_compiled_call():
     )
     connector = Mock()
     observed_states = []
+    call_order = []
+
+    def record_wait(layer_name):
+        assert layer_name == model.prefix
+        call_order.append("wait")
 
     def record_ready_state(layer_name, kv_cache_layer, attn_metadata):
-        assert layer_name == ""
+        assert layer_name == model.prefix
         assert kv_cache_layer == []
         assert attn_metadata is forward_context.attn_metadata
+        call_order.append("save")
         observed_states.append(tuple(state.clone() for state in model.kv_cache))
 
+    connector.wait_for_layer_load.side_effect = record_wait
     connector.save_kv_layer.side_effect = record_ready_state
 
     def causal_conv1d(output_tensor, mixed_qkv, conv_weights, **kwargs):
@@ -173,6 +180,7 @@ def test_connector_observes_updated_gdn_state_for_each_compiled_call():
         patch("vllm_ascend.ops.gdn.get_pcp_group", return_value=SimpleNamespace(world_size=1)),
         patch("vllm_ascend.ops.gdn.DeviceOperator.fused_gdn_gating", return_value=gating),
         patch("vllm_ascend.ops.gdn.clear_ssm_states"),
+        patch.object(AscendGatedDeltaNetAttention, "_probe_fused_chunk", return_value=False),
         patch("vllm_ascend.ops.gdn.chunk_gated_delta_rule", side_effect=chunk_attention),
         patch.object(
             torch.ops._C_ascend,
@@ -192,6 +200,8 @@ def test_connector_observes_updated_gdn_state_for_each_compiled_call():
             torch.testing.assert_close(compiled_output, hidden_states + 1)
 
     assert connector.save_kv_layer.call_count == 3
+    assert connector.wait_for_layer_load.call_count == 3
+    assert call_order == ["wait", "save"] * 3
     for execution, (conv_state, ssm_state) in enumerate(observed_states, start=1):
         torch.testing.assert_close(conv_state, torch.full_like(conv_state, execution))
         torch.testing.assert_close(ssm_state, torch.full_like(ssm_state, execution))

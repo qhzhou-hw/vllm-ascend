@@ -2,7 +2,8 @@
 
 本文记录 `AscendStoreConnector` 使用 Mooncake backend 进行 layerwise KV
 cache 保存和加载的实现。重点是 Mooncake 的 key-based 数据路径、hybrid KV
-cache group 的处理，以及 DeepSeek-V4 这类一个物理层包含多种 cache 布局的模型。
+cache group 的处理，以及 DeepSeek-V4 多 attention cache 与 Qwen3.5
+Full Attention/GDN state 这两类 hybrid 布局。
 
 使用方法和部署参数参见
 [Layerwise KV Pool](../../user_guide/feature_guide/layerwise_kv_pool.md)。本文面向后续维护、
@@ -34,13 +35,14 @@ cache entry 数量也可能不同。
 2. 使用 Mooncake 的 key-based `batch_put_from_multi_buffers` 和
    `batch_get_into_multi_buffers` 完成真实 NPU buffer 读写；
 3. 正确支持多个 attention KV cache group；
-4. 以所有 group 的公共连续命中作为可加载前缀，避免部分 group 命中导致 KV 不一致；
-5. 保持 Memcache GVA buffer reuse 路径的既有行为。
+4. 支持 `mamba_cache_mode=align` 的 conv/SSM recurrent state；
+5. 以所有 group 的公共可恢复命中作为可加载前缀，避免部分 group 命中导致状态不一致；
+6. 保持 Memcache GVA buffer reuse 路径的既有行为。
 
 以下内容不在当前范围内：
 
 - Mooncake 上的跨层 NPU buffer reuse；
-- hybrid cache 中的 Mamba/SSM state；
+- `mamba_cache_mode=none` 或 `all` 的 state layerwise 持久化；
 - layerwise 与 context parallel 的组合；
 - layerwise TP-mismatch 数据重排。
 
@@ -383,9 +385,38 @@ layer save。因此它可以直接复用 group-aware Mooncake layerwise 数据�
 - 两次请求的生成文本、prompt token 数和 completion token 数一致。
 
 该结论覆盖使用 `Qwen3ForCausalLM` 标准 Full Attention 路径的 Qwen3 Dense 系列。当前测试
-没有覆盖 Qwen3 MoE。Qwen3-Next、Qwen3.5 等包含 GDN/Mamba state 的 hybrid 模型仍不在
-支持范围内，因为 state cache 尚未实现与 attention KV 等价的 layerwise 保存、恢复和
-scheduler 一致性语义。
+没有覆盖 Qwen3 MoE。Qwen3.5 hybrid 的状态路径见下一节。
+
+### 10.4 Qwen3.5 Hybrid
+
+Qwen3.5 每四个 decoder layer 中包含三个 GDN layer 和一个 Full Attention layer。Full
+Attention 继续使用通用 attention layerwise hook；GDN 则原地更新两个 state tensor：
+conv state 和 SSM recurrent state。
+
+为保证状态恢复发生在第一次读取之前，`AscendGatedDeltaNetAttention._forward_core()` 在
+取得当前层 state 前调用 `wait_for_kv_layer_from_connector(self.prefix)`，并在 conv/SSM
+都完成更新后调用 `maybe_save_kv_layer_to_connector()`。该顺序同时覆盖 eager 和
+`torch.compile` custom-op 路径。
+
+Qwen3.5 使用 `mamba_cache_mode=align`。其 block table 为完整逻辑前缀保留位置，但历史
+位置指向保留的 null block 0，只有当前 checkpoint 对应真实 state block。Worker 把
+`group_uses_align_state` 写入 request；Mooncake key-based layer thread 在保存和加载时跳过
+null block，只传输有效 block 中同一物理层的 conv/SSM 两个 cache entry。Scheduler 对
+attention group 使用连续命中，对 aligned state group 使用离散 checkpoint 命中，最终仍
+取所有 group 的公共可恢复 token 位置。
+
+Mooncake 的 key-based layerwise load 会从 block 0 恢复已在外部存储中验证的完整前缀，
+即使 vLLM 本地 prefix cache 报告相同长度的 HBM 命中也不会省略 get。原因是统一的 token
+命中长度不能证明每个 GDN layer 的 recurrent state 仍在本地可用。Memcache GVA 路径仍对
+独立常驻层保留原有的本地命中优化。
+
+验证分为两层：
+
+- `test_mooncake_aligned_mamba_state_roundtrip` 使用真实 Mooncake backend，将随机 conv/SSM
+  NPU state 保存、覆写后恢复，并要求有效 block bitwise equal、null block 未被写入；
+- `test_qwen3_5_mooncake_layerwise.py` 使用 `Qwen/Qwen3.5-0.8B` BF16 真实 checkpoint，
+  以超过 1024 tokens 的完整 hybrid transfer unit 重复请求，同时覆盖 18 个 GDN layer 和
+  6 个 Full Attention layer，并检查 24 次 put、24 次 get 及零失败计数。
 
 ## 11. 配置示例
 
@@ -536,7 +567,7 @@ Hybrid load 不能把单个 group 的失败安全地回退成局部 block recomp
 ## 14. 当前限制
 
 - Mooncake layerwise 使用 key-based path，不支持 Memcache GVA 的跨层 buffer reuse。
-- 仅支持 attention KV 类的 hybrid group；Mamba/SSM state cache 尚未支持。
+- Mamba/SSM state 仅支持 `mamba_cache_mode=align`，并以 Qwen3.5 GDN 验证。
 - Layerwise 与 CP backend 尚未完成统一支持。
 - Layerwise thread 不支持 TP-mismatch 处理。
 - Hybrid load 失败不支持 per-block recompute fallback。
@@ -550,13 +581,13 @@ Qwen、GLM、Kimi 等模型不应通过模型名硬编码接入。扩展时依�
 1. attention backend 在 KV 使用前调用 `wait_for_kv_layer_from_connector()`；
 2. attention 写完 KV 后调用 `maybe_save_kv_layer_to_connector()`；
 3. 每个 cache layer name 能正确提取物理层号；
-4. `KVCacheConfig` 中所有目标 group 都是可恢复的 attention KV，而不是状态机 state；
+4. state group 必须提供可恢复的 block 语义；Mamba 当前要求 `mamba_cache_mode=align`；
 5. group block size 都能由共同 `hash_block_size` 整除；
 6. cache family 能区分不同压缩布局；
 7. 每层多个 cache entry 时生成正确的 offsets；
-8. scheduler 只报告所有 group 的公共连续命中；
+8. scheduler 只报告所有 group 的公共可恢复命中（attention 连续、aligned state 离散）；
 9. 增加至少一个真实 Mooncake roundtrip 数值测试；
 10. 增加重复请求测试，确认第一次 put、第二次 get 均真实发生。
 
-满足这些条件的 MLA/SFA/DSA 模型可以复用当前通用 group-aware 数据路径；包含
-Mamba/SSM state 的 hybrid 模型需要先实现 state 序列化、恢复和 scheduler 一致性语义。
+满足这些条件的 MLA/SFA/DSA 模型可以复用当前通用 group-aware 数据路径；使用与
+Qwen3.5 相同 GDN hook 和 aligned Mamba state 语义的模型仍需增加真实权重验证后再声明支持。

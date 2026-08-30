@@ -1100,9 +1100,7 @@ class TestKVPoolWorkerProcessLayerData(unittest.TestCase):
         ]
         send_thread = object.__new__(KVCacheStoreKeyLayerSendingThread)
         group_caches = {0: {0: [(0, 16, ["g0"])]}, 1: {0: [(0, 32, ["g1"])]}}
-        send_thread.build_cached_process_tokens = MagicMock(
-            side_effect=lambda task: group_caches[task.group_id]
-        )
+        send_thread.build_cached_process_tokens = MagicMock(side_effect=lambda task: group_caches[task.group_id])
         worker.kv_send_thread = send_thread
 
         worker._build_shared_save_data()
@@ -1149,6 +1147,7 @@ class TestKVPoolWorkerProcessLayerData(unittest.TestCase):
 
     def test_reused_layer_loads_full_cached_prefix(self):
         worker = self._make_worker()
+        worker.use_gva_layerwise = True
         worker.layerwise_offload = True
         worker.independent_layers = [0]
         request = ReqMeta(
@@ -1172,9 +1171,33 @@ class TestKVPoolWorkerProcessLayerData(unittest.TestCase):
         self.assertEqual((independent_range.start_block, independent_range.end_block), (1, 2))
         self.assertEqual((reused_range.start_block, reused_range.end_block), (0, 2))
 
+    def test_mooncake_layerwise_load_restores_locally_cached_prefix(self):
+        worker = self._make_worker()
+        worker.use_layerwise = True
+        worker.use_gva_layerwise = False
+        worker.layerwise_offload = False
+        request = ReqMeta(
+            req_id="r1",
+            token_len_chunk=32,
+            block_ids=[0, 1],
+            block_hashes=["h0", "h1"],
+            load_spec=LoadSpec(
+                vllm_cached_tokens=16,
+                kvpool_cached_tokens=32,
+                can_load=True,
+                token_len=32,
+            ),
+        )
+
+        worker._process_load_for_layer_batch([request], 0)
+
+        load_range = worker.layer_load_tasks[0][0].block_ranges[0]
+        self.assertEqual((load_range.start_block, load_range.end_block), (0, 2))
+
     def test_mtp_load_uses_safe_extent_not_store_skip_extent(self):
         worker = self._make_worker()
         worker.use_eagle = True
+        worker.use_gva_layerwise = True
         worker.layerwise_offload = True
         worker.independent_layers = [0, 1]
         request = ReqMeta(
