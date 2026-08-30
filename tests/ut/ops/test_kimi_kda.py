@@ -2,10 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 from torch import nn
+from vllm.forward_context import ForwardContext, override_forward_context
 
 from vllm_ascend.ops.kimi_kda import (
     _PACKED_CONV_WEIGHT_NAME,
@@ -154,6 +155,93 @@ def test_kda_empty_forward_context_clears_preallocated_output():
         )
 
     assert torch.equal(core_attn_out, torch.zeros_like(core_attn_out))
+
+
+def test_connector_observes_updated_kda_state_after_decode():
+    attention = AscendKimiK3DeltaAttention.__new__(AscendKimiK3DeltaAttention)
+    nn.Module.__init__(attention)
+    attention.prefix = "model.layers.0.self_attn"
+    attention.head_dim = 1
+    attention.register_parameter(
+        _PACKED_CONV_WEIGHT_NAME,
+        nn.Parameter(torch.ones(2, 6), requires_grad=False),
+    )
+    conv_state = torch.zeros(1, 2, 2)
+    recurrent_state = torch.zeros(1, 2, 1, 1)
+    attention.kv_cache = (conv_state, recurrent_state)
+    attention.o_norm = Mock(side_effect=lambda hidden_states, _gate: hidden_states)
+
+    query_start_loc = torch.tensor([0, 1], dtype=torch.int32)
+    state_indices = torch.tensor([0], dtype=torch.int32)
+    metadata = SimpleNamespace(
+        num_actual_tokens=1,
+        num_prefills=0,
+        num_decodes=1,
+        num_decode_tokens=1,
+        spec_sequence_masks=None,
+        spec_token_indx=None,
+        non_spec_token_indx=None,
+        non_spec_query_start_loc=query_start_loc,
+        non_spec_state_indices_tensor=state_indices,
+        non_spec_decode_metadata=SimpleNamespace(
+            causal_conv1d=SimpleNamespace(
+                query_start_loc=query_start_loc,
+                cache_indices=state_indices,
+            )
+        ),
+    )
+    forward_context = ForwardContext(
+        no_compile_layers={attention.prefix: attention},
+        attn_metadata={attention.prefix: metadata},
+        slot_mapping={},
+    )
+    connector = Mock()
+    call_order = []
+    observed_states = []
+
+    connector.wait_for_layer_load.side_effect = lambda layer_name: call_order.append(("wait", layer_name))
+
+    def record_state(layer_name, kv_cache_layer, attn_metadata):
+        assert kv_cache_layer == []
+        assert attn_metadata is forward_context.attn_metadata
+        call_order.append(("save", layer_name))
+        observed_states.append(tuple(state.clone() for state in attention.kv_cache))
+
+    connector.save_kv_layer.side_effect = record_state
+
+    def run_conv(mixed_qkv, *_args, **_kwargs):
+        conv_state.add_(1)
+        return mixed_qkv
+
+    def run_recurrent(_q, _k, v, _raw_gate, _beta, state, *_args, **_kwargs):
+        state.add_(2)
+        return v
+
+    core_attn_out = torch.empty(1, 1, 2, 1)
+    with (
+        override_forward_context(forward_context),
+        patch("vllm_ascend.ops.kimi_kda.GDNAttentionMetadata", object),
+        patch.object(attention, "_run_causal_conv1d", side_effect=run_conv),
+        patch.object(attention, "_run_recurrent", side_effect=run_recurrent),
+        patch("vllm_ascend.attention.utils.has_kv_transfer_group", return_value=True),
+        patch("vllm_ascend.attention.utils.is_v1_kv_transfer_group", return_value=True),
+        patch("vllm_ascend.attention.utils.get_kv_transfer_group", return_value=connector),
+    ):
+        attention._forward(
+            mixed_qkv=torch.arange(6, dtype=torch.float32).reshape(1, 6),
+            g1=torch.zeros(1, 1, 2, 1),
+            g2=torch.zeros(1, 2, 1),
+            beta=torch.zeros(1, 1, 2),
+            core_attn_out=core_attn_out,
+        )
+
+    assert call_order == [
+        ("wait", attention.prefix),
+        ("save", attention.prefix),
+    ]
+    assert len(observed_states) == 1
+    torch.testing.assert_close(observed_states[0][0], torch.ones_like(conv_state))
+    torch.testing.assert_close(observed_states[0][1], torch.full_like(recurrent_state, 2))
 
 
 def test_kda_conv_weight_is_packed_once_in_kernel_layout():

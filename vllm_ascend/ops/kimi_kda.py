@@ -27,6 +27,10 @@ from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
+from vllm_ascend.attention.utils import (
+    maybe_save_kv_layer_to_connector,
+    wait_for_kv_layer_from_connector,
+)
 from vllm_ascend.ops.gdn_attn_builder import AscendGDNAttentionBackend
 from vllm_ascend.ops.triton.fla.utils import clear_ssm_states
 
@@ -337,6 +341,11 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
         attn_metadata = attn_metadata_raw[self.prefix]
         assert isinstance(attn_metadata, GDNAttentionMetadata)
 
+        # KDA consumes and mutates its convolution and recurrent states in
+        # place. Restore the externally cached prefix before either state is
+        # read, matching the layerwise ordering used by GDN attention.
+        wait_for_kv_layer_from_connector(self.prefix)
+
         num_actual_tokens = attn_metadata.num_actual_tokens
         mixed_qkv = mixed_qkv[:num_actual_tokens]
         g1 = g1[:, :num_actual_tokens]
@@ -542,3 +551,7 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
         # static padding rows whose captured gate values are not live.
         core_attn_out[:, :num_actual_tokens].copy_(_zero_padded_output(normalized, num_live_tokens))
         core_attn_out[:, num_actual_tokens:].zero_()
+
+        # The connector uses the registered MambaSpec buffer addresses; this
+        # callback is the readiness signal after both KDA states were updated.
+        maybe_save_kv_layer_to_connector(self.prefix, [])

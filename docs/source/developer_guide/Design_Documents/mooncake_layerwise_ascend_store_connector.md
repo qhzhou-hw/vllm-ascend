@@ -2,8 +2,8 @@
 
 本文记录 `AscendStoreConnector` 使用 Mooncake backend 进行 layerwise KV
 cache 保存和加载的实现。重点是 Mooncake 的 key-based 数据路径、hybrid KV
-cache group 的处理，以及 DeepSeek-V4 多 attention cache 与 Qwen3.5
-Full Attention/GDN state 这两类 hybrid 布局。
+cache group 的处理，以及 DeepSeek-V4/GLM-5 多 attention cache、Qwen3.5
+Full Attention/GDN state 与 Kimi-K3 MLA/KDA state 这些 hybrid 布局。
 
 使用方法和部署参数参见
 [Layerwise KV Pool](../../user_guide/feature_guide/layerwise_kv_pool.md)。本文面向后续维护、
@@ -412,11 +412,41 @@ Mooncake 的 key-based layerwise load 会从 block 0 恢复已在外部存储中
 
 验证分为两层：
 
-- `test_mooncake_aligned_mamba_state_roundtrip` 使用真实 Mooncake backend，将随机 conv/SSM
-  NPU state 保存、覆写后恢复，并要求有效 block bitwise equal、null block 未被写入；
+- `test_mooncake_kimi_k3_aligned_kda_state_roundtrip` 使用真实 Mooncake backend，将随机
+  conv/recurrent NPU state 保存、覆写后恢复，并要求有效 block bitwise equal、null block
+  未被写入；这与 Qwen3.5 的两个 aligned state entry 使用相同传输语义；
 - `test_qwen3_5_mooncake_layerwise.py` 使用 `Qwen/Qwen3.5-0.8B` BF16 真实 checkpoint，
   以超过 1024 tokens 的完整 hybrid transfer unit 重复请求，同时覆盖 18 个 GDN layer 和
   6 个 Full Attention layer，并检查 24 次 put、24 次 get 及零失败计数。
+
+### 10.5 GLM-5 系列
+
+GLM-5、GLM-5.1 和 GLM-5.2 复用 DeepSeek Sparse Attention 架构。在 Ascend 上，
+DSA/SFA 实现都已经在读取主 KV 前调用 layer wait，并在主 KV 与 lightning indexer
+cache 写完后调用 layer save。GLM-5.2 中部分层持有 `main + indexer`，部分层只持有
+`main`；worker 使用 `group_layer_cache_entry_offsets` 表达这种不等长布局，同一个物理层
+的多个 entry 会作为一次 Mooncake layer transfer 提交。
+
+因此 GLM 不需要基于模型名增加 connector 分支。
+`test_component_sharing_merges_main_across_a_and_b_layers` 验证 GLM-5.2 的 A/B layer
+物理布局；Mooncake hybrid roundtrip 使用 main/indexer 不等长 entry 进行真实 NPU
+put/get，并要求逐块 bitwise equal。当前不声明 layerwise 与 DSA context parallel 的组合
+支持。
+
+### 10.6 Kimi 系列
+
+Kimi-K2、Kimi-K2.5 和 Kimi-K2.6 的语言模型走通用 MLA 路径，可直接复用 MLA
+layerwise hook。Kimi-K3 是 MLA 与 KDA 的 hybrid 模型：MLA 部分同样复用通用路径，
+KDA 每层原地更新 conv state 和 recurrent state。
+
+`AscendKimiK3DeltaAttention._forward()` 在取得 KDA state 前等待当前层 load，在 conv 与
+recurrent kernel 都完成并更新 state 后触发 save。和 Qwen3.5 一样，传给 save callback
+的 tensor list 为空，因为 connector 使用初始化时注册的 `MambaSpec` NPU 地址；callback
+只负责声明该层状态已经可读。KDA 状态传输目前要求 `mamba_cache_mode=align`。
+
+本次支持范围是 Kimi-K3 baseline inference。RecoverSSM 会额外增加 correction/key-gate
+record state，当前 Ascend KDA forward 尚未实现该状态路径；DSpark 与 CP 也没有纳入本次
+layerwise 验证，因此不应据此声明支持。
 
 ## 11. 配置示例
 
@@ -515,6 +545,22 @@ python -m pytest -q \
 
 这里的计数 wrapper 会继续调用真实 `MooncakeBackend.put/get`，不是 mock。
 
+Kimi-K3 aligned KDA state 的独立 roundtrip 同样经过真实 Mooncake backend，conv 与
+recurrent 两个 state entry 在覆写后按位恢复：
+
+```json
+{
+    "put_calls": 1,
+    "put_keys": 1,
+    "put_bytes": 704,
+    "get_calls": 1,
+    "get_keys": 1,
+    "get_bytes": 704,
+    "max_abs_diff": 0.0,
+    "bitwise_equal": true
+}
+```
+
 ### 12.3 请求级验证
 
 使用 4 层 DeepSeek-V4 tiny config、随机 dummy 权重和 160-token prompt 进行两次请求：
@@ -543,6 +589,18 @@ usage_equal: true
 与 DeepSeek-V4 tiny 验证不同，Qwen3 使用公开真实 checkpoint，未修改模型层数、attention
 布局或权重。
 
+GLM-5 使用官方 config 裁剪为 2 层并加载随机 dummy 权重。两次相同的 201-token 请求均
+返回 HTTP 200 且输出和 usage 一致；第一次请求观测到 2 次 put，第二次命中 128 个外部
+KV token 并观测到 2 次 get，失败计数为 0。
+
+Kimi-K3 使用官方 config 构造 4 层 hybrid tiny 模型（3 个 KDA layer 和 1 个 MLA
+layer），加载随机 dummy 权重并启用 `mamba_cache_mode=align`。两次相同的 1101-token
+请求均返回 HTTP 200 且输出和 usage 一致；第一次请求对 4 个物理层各执行 1 次 put，
+第二次命中 1024 个外部 token 并对 4 层各执行 1 次 get，失败计数为 0。
+
+GLM-5 和 Kimi-K3 的请求级结果验证了有限卡环境中的 connector 控制流与状态恢复，不是
+完整 checkpoint 的精度结论；生产支持仍需补充真实权重回归。
+
 ## 13. 错误处理与可观测性
 
 Mooncake backend 在 debug 日志中输出实际调用：
@@ -567,7 +625,8 @@ Hybrid load 不能把单个 group 的失败安全地回退成局部 block recomp
 ## 14. 当前限制
 
 - Mooncake layerwise 使用 key-based path，不支持 Memcache GVA 的跨层 buffer reuse。
-- Mamba/SSM state 仅支持 `mamba_cache_mode=align`，并以 Qwen3.5 GDN 验证。
+- Mamba/SSM state 仅支持 `mamba_cache_mode=align`，已覆盖 Qwen3.5 GDN 与 Kimi-K3 KDA。
+- Kimi-K3 RecoverSSM、DSpark 和 CP 尚未纳入 layerwise 支持范围。
 - Layerwise 与 CP backend 尚未完成统一支持。
 - Layerwise thread 不支持 TP-mismatch 处理。
 - Hybrid load 失败不支持 per-block recompute fallback。

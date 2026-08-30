@@ -159,8 +159,8 @@ def test_mooncake_hybrid_layerwise_kv_roundtrip(mooncake_store_config: Path) -> 
     torch.npu.set_device(0)
     torch.manual_seed(20260829)
 
-    # Group 0 models the normal attention KV layout: one cache entry per layer.
-    # Group 1 models the DSV4 indexer/compressor layout: the first layer has two
+    # Group 0 models the normal SFA/DSA KV layout: one cache entry per layer.
+    # Group 1 models the GLM-5.2/DSV4 indexer layout: the first layer has two
     # cache entries while the second has one, and it uses a larger block size.
     group_caches = {
         0: [_new_cache(16, 8), _new_cache(16, 8)],
@@ -336,7 +336,7 @@ def test_mooncake_hybrid_layerwise_kv_roundtrip(mooncake_store_config: Path) -> 
     )
 
 
-def test_mooncake_aligned_mamba_state_roundtrip(mooncake_store_config: Path) -> None:
+def test_mooncake_kimi_k3_aligned_kda_state_roundtrip(mooncake_store_config: Path) -> None:
     del mooncake_store_config
     torch.npu.set_device(0)
     torch.manual_seed(20260830)
@@ -349,7 +349,7 @@ def test_mooncake_aligned_mamba_state_roundtrip(mooncake_store_config: Path) -> 
     originals = [state.cpu().clone() for state in states]
 
     database = ChunkedTokenDatabase(
-        [KeyMetadata(f"qwen35-mamba-{uuid.uuid4().hex}", 0, 0, 0, 0)],
+        [KeyMetadata(f"kimi-k3-kda-{uuid.uuid4().hex}", 0, 0, 0, 0)],
         [block_size],
         partitions=None,
         hash_block_size=_HASH_BLOCK_SIZE,
@@ -368,8 +368,33 @@ def test_mooncake_aligned_mamba_state_roundtrip(mooncake_store_config: Path) -> 
         [state.data_ptr() for state in states],
         [state.numel() * state.element_size() for state in states],
     )
+    io_stats = {
+        "put_calls": 0,
+        "put_keys": 0,
+        "put_bytes": 0,
+        "get_calls": 0,
+        "get_keys": 0,
+        "get_bytes": 0,
+    }
+    real_put = backend.put
+    real_get = backend.get
+
+    def counted_put(keys: list[str], addrs: list[list[int]], sizes: list[list[int]]) -> None:
+        io_stats["put_calls"] += 1
+        io_stats["put_keys"] += len(keys)
+        io_stats["put_bytes"] += sum(sum(key_sizes) for key_sizes in sizes)
+        real_put(keys, addrs, sizes)
+
+    def counted_get(keys: list[str], addrs: list[list[int]], sizes: list[list[int]]) -> list[int] | None:
+        io_stats["get_calls"] += 1
+        io_stats["get_keys"] += len(keys)
+        io_stats["get_bytes"] += sum(sum(key_sizes) for key_sizes in sizes)
+        return real_get(keys, addrs, sizes)
+
+    backend.put = counted_put  # type: ignore[method-assign]
+    backend.get = counted_get  # type: ignore[method-assign]
     request = ReqMeta(
-        req_id="qwen35-mamba-roundtrip",
+        req_id="kimi-k3-kda-roundtrip",
         token_len_chunk=64,
         save_end_token=64,
         block_ids_by_group=[[0, 2]],
@@ -445,3 +470,22 @@ def test_mooncake_aligned_mamba_state_roundtrip(mooncake_store_config: Path) -> 
         assert torch.equal(actual_cpu[2], expected[2])
         assert torch.all(actual_cpu[1] == _SENTINEL)
         assert torch.all(actual_cpu[3] == _SENTINEL)
+
+    assert io_stats["put_calls"] == 1
+    assert io_stats["get_calls"] == 1
+    assert io_stats["put_keys"] == 1
+    assert io_stats["get_keys"] == 1
+    assert io_stats["put_bytes"] == io_stats["get_bytes"]
+    print(
+        json.dumps(
+            {
+                "backend": "mooncake",
+                "model_cache": "kimi-k3-kda",
+                "state_entries": len(states),
+                **io_stats,
+                "max_abs_diff": 0.0,
+                "bitwise_equal": True,
+            },
+            sort_keys=True,
+        )
+    )
