@@ -11,6 +11,10 @@ disaggregation** (`kv_role: "kv_producer"` / `"kv_consumer"`) scenarios. See the
 [KV Pool guide](kv_pool.md) for the general KV Pool architecture and backend
 setup.
 
+For the Mooncake key-based data path, hybrid KV cache group mapping, scheduler
+lookup rules, and DeepSeek-V4 implementation details, see
+[Mooncake Layerwise AscendStoreConnector Design](../../developer_guide/Design_Documents/mooncake_layerwise_ascend_store_connector.md).
+
 For Prefill-side NPU memory reduction through cross-layer KV buffer reuse,
 including MTP and sparse C8 layouts, see
 [Layerwise and Sparse KV Cache Offloading](layerwise_and_sparse_kv_cache_offloading.md).
@@ -37,10 +41,10 @@ than concentrated as a single blocking step.
 
 ## Prerequisites
 
-Layerwise mode currently requires the **memcache** backend
-(`backend: "memcache"`). Install and configure memcache_hybrid before
-proceeding — see the [KV Pool guide](kv_pool.md) for memcache installation,
-config files (`mmc-meta.conf` / `mmc-local.conf`), and MetaService startup.
+Layerwise mode supports the **memcache** and **mooncake** backends. Install and
+configure the selected backend before proceeding — see the
+[KV Pool guide](kv_pool.md) for backend installation and service startup.
+Cross-layer KV buffer reuse remains specific to Memcache.
 
 Additional setup:
 
