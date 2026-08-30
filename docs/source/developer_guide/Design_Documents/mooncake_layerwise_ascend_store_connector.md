@@ -340,7 +340,7 @@ Receiving thread 对每个 group：
 `layerwise_prefetch_layers` 控制提前提交多少后续层。Attention 到达层边界时仍会调用
 `wait_for_layer_load()`，因此预取只改变重叠程度，不改变正确性约束。
 
-## 10. DeepSeek-V4 的额外适配
+## 10. 模型适配
 
 ### 10.1 Scheduler block size 与物理 page size
 
@@ -366,6 +366,26 @@ DeepSeek-V4 中这个值可能变为 2，但 SFA indexer 的物理 page 仍要�
 `AscendDSAImpl.process_weights_after_loading()` 现在只对未处理的二维、非 A5 权重执行与
 真实 loader 相同的 reshape/transpose；已经是三维的真实权重和在线 reload 权重保持不变。
 该适配用于小模型随机权重的 connector 测试，不改变真实 checkpoint 的布局。
+
+### 10.3 Qwen3 Dense
+
+Qwen3 Dense 使用标准 Full Attention 和单个 KV cache group。每个 attention layer 都通过
+vLLM 通用 attention wrapper，在读取 KV 前等待 layer load，并在 attention 完成后触发
+layer save。因此它可以直接复用 group-aware Mooncake layerwise 数据路径，不需要按模型名
+增加分支或单独定义 key schema。
+
+`tests/e2e/pull_request/one_card/test_qwen3_mooncake_layerwise.py` 使用
+`Qwen/Qwen3-0.6B` BF16 真实权重验证：
+
+- 模型包含 28 个 Full Attention layer，Mooncake master 观测到 28 次 put start/end；
+- 第二次相同请求观测到 28 次 get，并命中 128 个外部 KV token；
+- put/get failure 均为 0，Mooncake 中至少存在 28 个 layer key；
+- 两次请求的生成文本、prompt token 数和 completion token 数一致。
+
+该结论覆盖使用 `Qwen3ForCausalLM` 标准 Full Attention 路径的 Qwen3 Dense 系列。当前测试
+没有覆盖 Qwen3 MoE。Qwen3-Next、Qwen3.5 等包含 GDN/Mamba state 的 hybrid 模型仍不在
+支持范围内，因为 state cache 尚未实现与 attention KV 等价的 layerwise 保存、恢复和
+scheduler 一致性语义。
 
 ## 11. 配置示例
 
@@ -476,6 +496,21 @@ python -m pytest -q \
 
 Tiny 测试把 `compress_ratios` 临时设为 `[0, 0, 4, 4]`，使传输粒度从 4096 降到
 128。该修改只用于有限卡数环境下触发完整 save/load，不是生产模型默认参数。
+
+Qwen3 Dense 的真实权重请求级验证结果：
+
+```text
+model: Qwen/Qwen3-0.6B (BF16, 28 layers)
+prompt_tokens: 246
+external_cached_tokens: 128
+Mooncake put/get: 28/28
+Mooncake put/get failures: 0/0
+generated_text_equal: true
+usage_equal: true
+```
+
+与 DeepSeek-V4 tiny 验证不同，Qwen3 使用公开真实 checkpoint，未修改模型层数、attention
+布局或权重。
 
 ## 13. 错误处理与可观测性
 

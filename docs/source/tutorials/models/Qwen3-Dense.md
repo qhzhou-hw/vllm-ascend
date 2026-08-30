@@ -14,6 +14,38 @@ Please refer to the [Supported Features List](../../user_guide/support_matrix/su
 
 Please refer to the [Feature Guide](../../user_guide/feature_guide/index.md) for feature configuration information.
 
+### Mooncake layerwise KV Pool
+
+Qwen3 Dense models using the standard Full Attention path support layerwise KV
+cache save and load through `AscendStoreConnector` with the Mooncake backend.
+The integration is validated with real `Qwen/Qwen3-0.6B` BF16 weights: the first
+request saves all 28 attention layers, and a repeated request loads all 28
+layers from Mooncake with identical generated text.
+
+Configure the connector as follows:
+
+```json
+{
+    "kv_connector": "AscendStoreConnector",
+    "kv_role": "kv_both",
+    "kv_connector_extra_config": {
+        "backend": "mooncake",
+        "lookup_rpc_port": "0",
+        "use_layerwise": true
+    }
+}
+```
+
+Set `MOONCAKE_CONFIG_PATH` to the Mooncake configuration file before starting
+`vllm serve`. See [Layerwise KV Pool](../../user_guide/feature_guide/layerwise_kv_pool.md)
+for deployment parameters and the
+[design document](../../developer_guide/Design_Documents/mooncake_layerwise_ascend_store_connector.md)
+for implementation and verification details.
+
+This support statement does not include Qwen3-Next or Qwen3.5 hybrid
+GDN/Mamba models. Their state cache requires a separate layerwise persistence
+implementation.
+
 ## 3 Prerequisites
 
 ### 3.1 Model Weight
