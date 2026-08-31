@@ -17,6 +17,7 @@
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
@@ -34,6 +35,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     get_group_cache_family,
     infer_cache_transfer_granularity,
     infer_group_block_sizes,
+    infer_group_cache_families,
     uses_hybrid_kv_cache,
 )
 
@@ -67,6 +69,36 @@ class TestCacheLayoutHelpers(unittest.TestCase):
     def test_get_group_cache_family(self):
         self.assertEqual(get_group_cache_family(["c1", "c2"], 1), "c2")
         self.assertEqual(get_group_cache_family(["c1"], 3), "default")
+
+    def test_infer_group_cache_families_prefers_model_config(self):
+        scheduler_group = SimpleNamespace(
+            layer_names=["model.layers.0.self_attn"],
+            kv_cache_spec=SimpleNamespace(compress_ratio=4),
+        )
+        worker_group = SimpleNamespace(
+            layer_names=["model.layers.0.self_attn"],
+            kv_cache_spec=SimpleNamespace(compress_ratio=None),
+        )
+
+        with patch(
+            "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata._get_layer_compress_ratio",
+            return_value=1,
+        ):
+            scheduler_families = infer_group_cache_families([scheduler_group], [1])
+            worker_families = infer_group_cache_families([worker_group], [1])
+
+        self.assertEqual(scheduler_families, ["c1"])
+        self.assertEqual(worker_families, scheduler_families)
+
+    def test_infer_group_cache_families_falls_back_to_spec(self):
+        group = SimpleNamespace(
+            layer_names=["model.layers.0.self_attn"],
+            kv_cache_spec=SimpleNamespace(compress_ratio=4),
+        )
+
+        for compress_ratios in (None, []):
+            with self.subTest(compress_ratios=compress_ratios):
+                self.assertEqual(infer_group_cache_families([group], compress_ratios), ["c4"])
 
     def test_get_group_block_size(self):
         self.assertEqual(get_group_block_size([16, 32], 1), 32)

@@ -216,29 +216,35 @@ def infer_group_cache_families(
 
     families: list[str] = []
     for group in kv_cache_groups:
+        layer_names = list(getattr(group, "layer_names", []))
+        # Prefer model metadata shared by the scheduler and workers. Worker-side
+        # cache specs may be rebuilt and lose their compression attributes.
+        if compress_ratios and layer_names:
+            group_ratios = {
+                _get_layer_compress_ratio(layer_name, compress_ratios, hf_config) for layer_name in layer_names
+            }
+            if len(group_ratios) == 1:
+                families.append(infer_cache_family_from_ratio(next(iter(group_ratios))))
+            else:
+                logger.debug(
+                    "KV cache group has mixed layer compress ratios %s for layers %s; using mixed cache family.",
+                    sorted(group_ratios, key=lambda ratio: -1 if ratio is None else ratio),
+                    layer_names,
+                )
+                families.append("mixed")
+            continue
+
         spec_ratios = _get_group_spec_ratios(group)
         if len(spec_ratios) == 1:
             families.append(infer_cache_family_from_ratio(next(iter(spec_ratios))))
-            continue
-        if len(spec_ratios) > 1:
-            families.append("mixed")
-            continue
-
-        layer_names = list(getattr(group, "layer_names", []))
-        if compress_ratios is None or not layer_names:
-            families.append("default")
-            continue
-
-        group_ratios = {_get_layer_compress_ratio(layer_name, compress_ratios, hf_config) for layer_name in layer_names}
-        if len(group_ratios) == 1:
-            families.append(infer_cache_family_from_ratio(next(iter(group_ratios))))
-        else:
+        elif len(spec_ratios) > 1:
             logger.debug(
-                "KV cache group has mixed layer compress ratios %s for layers %s; using mixed cache family.",
-                sorted(group_ratios, key=lambda ratio: -1 if ratio is None else ratio),
-                layer_names,
+                "KV cache group has mixed spec compress ratios %s; using mixed cache family.",
+                sorted(spec_ratios, key=lambda ratio: -1 if ratio is None else ratio),
             )
             families.append("mixed")
+        else:
+            families.append("default")
     return families
 
 
