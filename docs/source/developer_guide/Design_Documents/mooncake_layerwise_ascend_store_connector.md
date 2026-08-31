@@ -602,6 +602,43 @@ recurrent 两个 state entry 在覆写后按位恢复：
 Tiny 测试把 `compress_ratios` 临时设为 `[0, 0, 4, 4]`，使传输粒度从 4096 降到
 128。该修改只用于有限卡数环境下触发完整 save/load，不是生产模型默认参数。
 
+为进一步比较完整的首 token tensor，
+`tests/e2e/pull_request/one_card/test_deepseek_v4_mooncake_first_token.py` 提供三组隔离测试：
+
+1. 不启用 connector，完整 recompute，作为 ground truth；
+2. 启用 Mooncake，`use_layerwise=false`，冷请求 put 后由相同热请求 load；
+3. 启用 Mooncake，`use_layerwise=true`，冷请求逐层 put 后由相同热请求逐层 load。
+
+测试从 LongBench `qasper` 读取 3 条真实样本，按 LongBench 的 middle-truncation 语义保留
+首尾并裁剪为 192 tokens。每个 connector case 均关闭本地 prefix caching，因此热请求不能
+使用 HBM prefix；scheduler 对每条热请求都报告 `vllm_cached=0`、`kvpool_cached=128`。
+测试通过 `logprobs=-1` 获取首个生成 token 的完整 129280 维 log-probability tensor，
+而不仅比较 argmax token。
+
+Ascend 单卡实测结果：
+
+| case | Mooncake put | Mooncake get | max abs diff | bitwise equal |
+| --- | ---: | ---: | ---: | --- |
+| `use_layerwise=false` | 9 | 3 | 0.0 | true |
+| `use_layerwise=true` | 12 | 12 | 0.0 | true |
+
+两组测试的 put/get failure 均为 0，3 个样本的首 token id 与 ground truth 一致，并且
+`3 * 129280` 个 FP32 log-probability 值逐位一致。layerwise case 的 12 次 put/get 等于
+3 个样本乘以 4 个物理层；backend DEBUG 日志中的 key 也包含 `layer_id:0` 到
+`layer_id:3`。执行命令示例：
+
+```bash
+python tests/e2e/pull_request/one_card/\
+test_deepseek_v4_mooncake_first_token.py run \
+    --model-path /data/DeepSeek-V4-Flash-tiny \
+    --longbench-path /data/longbench \
+    --output-dir /data/dsv4-mooncake-first-token
+```
+
+脚本会保存每个 case 的完整 tensor、vLLM/Mooncake 日志、Mooncake 指标和
+`summary.json`。该结果证明随机权重 tiny 模型上的 connector save/load 数值一致性，
+不替代完整 DeepSeek-V4 checkpoint 的真实精度回归。
+
 Qwen3 Dense 的真实权重请求级验证结果：
 
 ```text
