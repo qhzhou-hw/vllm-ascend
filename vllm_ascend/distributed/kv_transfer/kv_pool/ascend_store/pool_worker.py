@@ -4,6 +4,7 @@ import importlib
 import math
 import threading
 import time
+from collections import defaultdict
 from collections.abc import Callable, Generator
 from typing import Any
 
@@ -818,6 +819,39 @@ class KVPoolWorker:
         self.m_store.register_buffer(ptrs, lengths)
         self._start_kv_transfer_threads()
 
+    def _sync_group_cache_families(self, requests: list[ReqMeta]) -> None:
+        reported_families = {
+            tuple(request.kv_cache_group_families)
+            for request in requests
+            if request.kv_cache_group_families is not None
+        }
+        if not reported_families:
+            return
+        if len(reported_families) != 1:
+            raise ValueError(f"Scheduler reported inconsistent KV cache families in one batch: {reported_families}")
+
+        scheduler_families = list(next(iter(reported_families)))
+        if len(scheduler_families) != self.num_kv_cache_groups:
+            raise ValueError(
+                "Scheduler/worker KV cache group count mismatch: "
+                f"scheduler={len(scheduler_families)}, worker={self.num_kv_cache_groups}"
+            )
+        if scheduler_families == self.kv_cache_group_families:
+            return
+
+        logger.warning(
+            "Worker KV cache families %s differ from scheduler families %s; using scheduler values for store keys.",
+            self.kv_cache_group_families,
+            scheduler_families,
+        )
+        # Keep the list object so the worker coordinator, which receives this
+        # list during initialization, observes the scheduler-authoritative values.
+        self.kv_cache_group_families[:] = scheduler_families
+        self.group_kv_cache_families = {
+            group_id: family for group_id, family in enumerate(scheduler_families)
+        }
+        self.token_database.set_group_cache_families(self.group_kv_cache_families)
+
     def start_load_kv(self, metadata: AscendConnectorMetadata):
         self.current_layer = 0
         self.layerwise_retrievers: list[Any] = []
@@ -832,6 +866,7 @@ class KVPoolWorker:
         logger.debug("KV pool worker start_load_kv requests=%d", len(metadata.requests))
         if len(metadata.requests) == 0:
             return
+        self._sync_group_cache_families(metadata.requests)
         if self.use_layerwise:
             for request in metadata.requests:
                 # Mamba align groups expose sparse logical block tables whose
@@ -839,6 +874,8 @@ class KVPoolWorker:
                 # to the layer threads so only live recurrent state is moved.
                 request.skip_null_blocks_by_group = self.group_uses_align_state
             self.process_layer_data(metadata.requests)
+            self._preload_align_state()
+            self._register_layerwise_save_requests(metadata.requests)
             return
         for request in metadata.requests:
             load_spec = request.load_spec
@@ -988,6 +1025,18 @@ class KVPoolWorker:
         request_block_ranges = []
         for request in requests:
             if request.can_save is None or not request.can_save:
+                continue
+            if (
+                group_id < len(self.group_uses_align_state)
+                and self.group_uses_align_state[group_id]
+                and request.target_token_len != request.save_end_token
+            ):
+                # The recurrent state reflects every token processed by the
+                # current forward.  When a partial tail extends beyond the
+                # externally keyed full-block boundary, saving that state
+                # under save_end_token would restore a future state and then
+                # compute the tail a second time.  Wait for an aligned prefill
+                # chunk before publishing this group's state.
                 continue
             save_start_block = request.save_start_token // block_size
             save_end_block = request.save_end_token // block_size
@@ -1610,6 +1659,28 @@ class KVPoolWorker:
                         if task.group_id == group_id:
                             task.shared_block_data = shared
 
+    def _preload_align_state(self) -> None:
+        """Restore align-mode recurrent state before its prepared copy runs.
+
+        ``preprocess_mamba`` prepares a checkpoint-to-running-state copy that
+        executes after ``start_load_kv`` and before the first model layer.
+        Mooncake's normal layer callbacks are too late for that copy.  Only
+        key-based recurrent-state tasks are restored eagerly; attention KV
+        remains pipelined with layer compute.
+        """
+        if not isinstance(self.kv_recv_thread, KVCacheStoreKeyLayerRecvingThread):
+            return
+        state_tasks = []
+        for layer_tasks in self.layer_load_tasks:
+            state_tasks.extend(
+                task
+                for task in layer_tasks
+                if task.group_id < len(self.group_uses_align_state)
+                and self.group_uses_align_state[task.group_id]
+            )
+        if state_tasks:
+            self.kv_recv_thread.preload_tasks(state_tasks)
+
     def process_layer_data(self, requests: list[ReqMeta]) -> None:
         if not requests:
             return
@@ -1630,6 +1701,35 @@ class KVPoolWorker:
             for group_id, layer_idx_in_group in group_layers:
                 self._process_load_for_layer_batch(requests, physical_layer, group_id, layer_idx_in_group)
         self._build_shared_load_data()
+
+    def _register_layerwise_save_requests(self, requests: list[ReqMeta]) -> None:
+        """Register a complete step's save work before layer execution.
+
+        Hybrid schedulers keep recurrent-state blocks alive until every
+        worker reports the request's completion event.  Registering all
+        physical-layer tasks up front prevents the first completed layer from
+        releasing those blocks while later layers still need them.
+        """
+        assert self.kv_send_thread is not None
+        send_thread = self.kv_send_thread
+        task_counts: defaultdict[str, int] = defaultdict(int)
+        for layer_tasks in self.layer_save_tasks:
+            for task in layer_tasks:
+                if isinstance(send_thread, KVCacheStoreLayerSendingThread) and task.shared_block_data is None:
+                    continue
+                for block_range in task.block_ranges:
+                    task_counts[block_range.request.req_id] += 1
+
+        for request in requests:
+            if request.can_save is None or not request.can_save:
+                continue
+            count = task_counts.get(request.req_id, 0)
+            if count:
+                send_thread.add_stored_request(request.req_id, request.event_id, count)
+            else:
+                # Non-writing ranks and fully cached requests still owe the
+                # scheduler one completion for the event it broadcast.
+                send_thread.record_completed_event(request.event_id)
 
     def _submit_ready_layer_loads(self) -> None:
         assert self.kv_recv_thread is not None
@@ -1695,9 +1795,6 @@ class KVPoolWorker:
         send_thread.raise_if_failed()
         self.sync_save_events[self.current_layer].record()
         if self.layer_save_tasks[self.current_layer]:
-            for task in self.layer_save_tasks[self.current_layer]:
-                for block_range in task.block_ranges:
-                    send_thread.add_stored_request(block_range.request.req_id)
             send_thread.add_request(self.layer_save_tasks[self.current_layer])  # type: ignore[arg-type]
         else:
             self.layer_save_finished_events[self.current_layer].set()
@@ -2043,8 +2140,7 @@ class KVPoolWorker:
         if self.kv_send_thread is not None:
             send_thread = self.kv_send_thread
             for req_id in meta.preempted_req_ids:
-                if isinstance(send_thread, (KVCacheStoreSendingThread, KVCacheStoreLayerSendingThread)):
-                    send_thread.delete_finished_stored_request(req_id)
+                send_thread.delete_finished_stored_request(req_id)
             self.kv_send_thread.discard_finished_requests(meta.preempted_req_ids)
             if self.use_layerwise:
                 self.kv_send_thread.get_and_clear_finished_requests()
@@ -2454,7 +2550,7 @@ class KVPoolWorker:
         return []
 
     def build_connector_worker_meta(self) -> AscendStoreKVConnectorWorkerMetadata | None:
-        if self.use_mamba and isinstance(self.kv_send_thread, KVCacheStoreSendingThread):
+        if self.use_mamba and self.kv_send_thread is not None:
             if ce := self.kv_send_thread.get_completed_events():
                 return AscendStoreKVConnectorWorkerMetadata(ce)
         return None

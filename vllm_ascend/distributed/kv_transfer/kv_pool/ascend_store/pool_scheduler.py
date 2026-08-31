@@ -196,6 +196,16 @@ class KVPoolScheduler:
                     for layer_name in group.layer_names
                 }
                 self.group_num_layers[group_id] = len(physical_layers)
+        logger.info(
+            "KVPoolScheduler cache layout: hybrid=%s groups=%s families=%s "
+            "block_sizes=%s hash_block_size=%d group_num_layers=%s",
+            self.use_hybrid,
+            self.kv_cache_group_ids,
+            self.kv_cache_group_families,
+            self.grouped_block_size,
+            self.hash_block_size,
+            self.group_num_layers,
+        )
         self.layerwise_offload = False
         if self.use_gva_layerwise:
             extra_config = get_gva_layerwise_config(vllm_config.kv_transfer_config)
@@ -358,26 +368,61 @@ class KVPoolScheduler:
                     f"expected={len(query_keys)}, actual={len(exists_states)}"
                 )
 
-            num_queried_hit_blocks = 0
+            states_by_block: list[list[int]] = []
             offset = 0
             for block_keys in keys_by_block:
                 block_states = exists_states[offset : offset + len(block_keys)]
                 offset += len(block_keys)
-                if all(exists == 1 for exists in block_states):
-                    num_queried_hit_blocks += 1
-                    continue
-                if any(exists == 0 for exists in block_states):
-                    break
-                raise RuntimeError(
-                    f"KV pool exists check failed for request {request.request_id}, "
-                    f"group {group_id}: states={block_states}"
-                )
+                if any(exists not in (0, 1) for exists in block_states):
+                    raise RuntimeError(
+                        f"KV pool exists check failed for request {request.request_id}, "
+                        f"group {group_id}: states={block_states}"
+                    )
+                states_by_block.append(block_states)
 
-            hits_per_group.append((query_start_block + num_queried_hit_blocks) * group_block_size)
+            if group_id in self.mamba_group_ids:
+                # Align-mode recurrent caches have one live state block per
+                # group.  The worker intentionally skips the null entries and
+                # stores the state under the latest prefix hash.  Search
+                # backwards for that state instead of requiring every earlier
+                # logical block to exist like attention KV.
+                num_queried_hit_blocks = 0
+                for block_index in range(len(states_by_block) - 1, -1, -1):
+                    if all(exists == 1 for exists in states_by_block[block_index]):
+                        num_queried_hit_blocks = block_index + 1
+                        break
+            else:
+                num_queried_hit_blocks = 0
+                for block_states in states_by_block:
+                    if not all(exists == 1 for exists in block_states):
+                        break
+                    num_queried_hit_blocks += 1
+
+            group_hit_tokens = (query_start_block + num_queried_hit_blocks) * group_block_size
+            hits_per_group.append(group_hit_tokens)
+            logger.debug(
+                "KV pool hybrid layerwise lookup req=%s group=%d block_size=%d "
+                "layers=%d blocks=%d hit_blocks=%d hit_tokens=%d sample_keys=%s sample_states=%s",
+                request.request_id,
+                group_id,
+                group_block_size,
+                self.group_num_layers[group_id],
+                len(keys_by_block),
+                num_queried_hit_blocks,
+                group_hit_tokens,
+                query_keys[: min(2, len(query_keys))],
+                exists_states[: min(2, len(exists_states))],
+            )
 
         if not hits_per_group:
             return 0
         hit_tokens = min(hits_per_group)
+        logger.debug(
+            "KV pool hybrid layerwise lookup final req=%s hits_per_group=%s hit_tokens=%d",
+            request.request_id,
+            hits_per_group,
+            hit_tokens,
+        )
         return self._floor_to_cache_transfer_granularity(hit_tokens)
 
     def _make_layerwise_gva_keys_for_hit_check(self, group_id: int, block_hash_hex: str) -> list[str]:

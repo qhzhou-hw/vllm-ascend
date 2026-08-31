@@ -342,6 +342,30 @@ Receiving thread 对每个 group：
 `layerwise_prefetch_layers` 控制提前提交多少后续层。Attention 到达层边界时仍会调用
 `wait_for_layer_load()`，因此预取只改变重叠程度，不改变正确性约束。
 
+### 9.1 Align recurrent state 的 forward 前恢复
+
+Full Attention KV 可以在每层 attention 计算前加载，但 align 模式的 recurrent state
+不能完全沿用这个时序。模型 runner 的顺序是：
+
+```text
+preprocess_mamba()                 # 生成 prev -> running state 的 copy metadata
+  -> AscendStoreConnector.start_load_kv()
+  -> KVPoolWorker._preload_align_state()
+  -> MooncakeBackend.get()         # 同步恢复所有 align state group
+  -> do_mamba_copy_block()         # 把已恢复 checkpoint 复制到 running state
+  -> model forward
+```
+
+如果等到 GDN/KDA 层的普通 layer callback 才执行 get，`do_mamba_copy_block()` 已经把 HBM
+中的旧 checkpoint 复制到了本轮运行槽位；之后即使 Mooncake 正确恢复原 checkpoint，计算
+仍会读取错误的 running state。因此 worker 在构造完 layer load task 后，把
+`group_uses_align_state=true` 的任务合并为一次同步 batch get。普通 attention task 仍按层
+提交，与模型计算重叠。
+
+预加载后的 state task 不从 layer task list 删除，而是标记为 `preloaded`。后续层线程只
+执行 event 和 request completion accounting，不重复调用 Mooncake get。这样最后一个物理层
+恰好是 state layer 时，也不会丢失 request-level receiving completion。
+
 ## 10. 模型适配
 
 ### 10.1 Scheduler block size 与物理 page size
@@ -404,6 +428,10 @@ Qwen3.5 使用 `mamba_cache_mode=align`。其 block table 为完整逻辑前缀�
 null block，只传输有效 block 中同一物理层的 conv/SSM 两个 cache entry。Scheduler 对
 attention group 使用连续命中，对 aligned state group 使用离散 checkpoint 命中，最终仍
 取所有 group 的公共可恢复 token 位置。
+
+所有 aligned state group 会在 `start_load_kv()` 中先合并恢复，再由 runner 执行实际的
+checkpoint-to-running-state copy；Full Attention group 仍在各 attention layer 前逐层恢复。
+这一区分对 Qwen3.5 GDN 和 Kimi-K3 KDA 使用相同的通用 cache-spec 判断，不依赖模型名。
 
 Mooncake 的 key-based layerwise load 会从 block 0 恢复已在外部存储中验证的完整前缀，
 即使 vLLM 本地 prefix cache 报告相同长度的 HBM 命中也不会省略 get。原因是统一的 token
@@ -600,6 +628,13 @@ layer），加载随机 dummy 权重并启用 `mamba_cache_mode=align`。两次�
 
 GLM-5 和 Kimi-K3 的请求级结果验证了有限卡环境中的 connector 控制流与状态恢复，不是
 完整 checkpoint 的精度结论；生产支持仍需补充真实权重回归。
+
+Qwen3.5 真实 checkpoint 还进行了 HBM eviction 压力验证：同一个 vLLM/Mooncake 实例先
+执行 10 条 LongBench `qasper` 请求，再发送 70 条长 prompt（共 347186 input tokens）顶掉
+本地 HBM prefix，最后重复最初 10 条请求。第二轮 10/10 请求的四个 cache group 均报告
+正的公共远端命中，共发生 70 次 Mooncake get 调用；冷/热两轮 macro score 都是 28.25，
+平均延迟从约 0.91 秒降至 0.38 秒。独立指纹诊断另确认目标样本 24 个 layer/group value
+均与此前保存值一致；指纹代码只用于验证，未保留在正式实现中。
 
 ## 13. 错误处理与可观测性
 

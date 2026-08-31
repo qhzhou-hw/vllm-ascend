@@ -539,6 +539,23 @@ class TestReqMeta(unittest.TestCase):
         self.assertEqual(meta.token_len_chunk, 32)
         self.assertIsNone(meta.load_spec)
 
+    def test_from_request_tracker_propagates_cache_families(self):
+        tracker = RequestTracker(
+            req_id="r1",
+            token_len=32,
+            allocated_block_ids_by_group=[[0, 1], [2]],
+        )
+
+        meta = ReqMeta.from_request_tracker(
+            tracker,
+            cache_transfer_granularity=16,
+            block_hashes=[b"h1", b"h2"],
+            kv_cache_group_families=["c4", "c128"],
+        )
+
+        self.assertIsNotNone(meta)
+        self.assertEqual(meta.kv_cache_group_families, ["c4", "c128"])
+
     def test_from_request_tracker_skip_save(self):
         tracker = RequestTracker(
             req_id="r1",

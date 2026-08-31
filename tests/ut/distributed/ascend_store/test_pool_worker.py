@@ -25,6 +25,7 @@ import numpy as np
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     AscendConnectorMetadata,
+    LayerBlockRange,
     LayerTransferTask,
     LoadSpec,
     ReqMeta,
@@ -120,6 +121,36 @@ class TestKVPoolWorkerHelpers(unittest.TestCase):
             with self.subTest(exists=exists):
                 result = cls.find_all_continuous_hit_positions(exists, positions, count, 48, 16)
                 self.assertEqual(result, expected)
+
+    def test_sync_group_cache_families_uses_scheduler_values(self):
+        cls = self._make_worker_class()
+        worker = cls.__new__(cls)
+        worker.num_kv_cache_groups = 2
+        worker.kv_cache_group_families = ["default", "default"]
+        coordinator_families = worker.kv_cache_group_families
+        worker.group_kv_cache_families = {0: "default", 1: "default"}
+        worker.token_database = MagicMock()
+        request = ReqMeta(
+            req_id="r1",
+            kv_cache_group_families=["c4", "c128"],
+        )
+
+        worker._sync_group_cache_families([request])
+
+        self.assertIs(worker.kv_cache_group_families, coordinator_families)
+        self.assertEqual(worker.kv_cache_group_families, ["c4", "c128"])
+        self.assertEqual(worker.group_kv_cache_families, {0: "c4", 1: "c128"})
+        worker.token_database.set_group_cache_families.assert_called_once_with({0: "c4", 1: "c128"})
+
+    def test_sync_group_cache_families_rejects_group_count_mismatch(self):
+        cls = self._make_worker_class()
+        worker = cls.__new__(cls)
+        worker.num_kv_cache_groups = 2
+        worker.kv_cache_group_families = ["default", "default"]
+        request = ReqMeta(req_id="r1", kv_cache_group_families=["c4"])
+
+        with self.assertRaisesRegex(ValueError, "group count mismatch"):
+            worker._sync_group_cache_families([request])
 
     def test_find_all_discontinuous_hit_positions(self):
         cls = self._make_worker_class()
@@ -1055,6 +1086,36 @@ class TestKVPoolWorkerProcessLayerData(unittest.TestCase):
             self.assertEqual(worker.layer_save_tasks[layer_id], [save_marker])
             self.assertEqual(worker.layer_load_tasks[layer_id], [load_marker])
 
+    def test_register_layerwise_save_requests_counts_all_layers(self):
+        worker = self._make_worker()
+        send_thread = MagicMock()
+        worker.kv_send_thread = send_thread
+        request = self._make_gva_request(can_save=True)
+        request.event_id = 17
+        block_range = LayerBlockRange(request, 0, 1)
+        worker.layer_save_tasks = [
+            [LayerTransferTask(layer_id=0, block_ranges=[block_range])],
+            [LayerTransferTask(layer_id=1, block_ranges=[block_range])],
+        ]
+
+        worker._register_layerwise_save_requests([request])
+
+        send_thread.add_stored_request.assert_called_once_with("r1", 17, 2)
+        send_thread.record_completed_event.assert_not_called()
+
+    def test_register_layerwise_save_requests_completes_noop_rank(self):
+        worker = self._make_worker()
+        send_thread = MagicMock()
+        worker.kv_send_thread = send_thread
+        request = self._make_gva_request(can_save=True)
+        request.event_id = 23
+        worker.layer_save_tasks = [[] for _ in range(worker.num_layers)]
+
+        worker._register_layerwise_save_requests([request])
+
+        send_thread.add_stored_request.assert_not_called()
+        send_thread.record_completed_event.assert_called_once_with(23)
+
     def test_build_shared_save_data_marks_last_actual_task(self):
         from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import (
             KVCacheStoreLayerSendingThread,
@@ -1111,6 +1172,47 @@ class TestKVPoolWorkerProcessLayerData(unittest.TestCase):
         self.assertIs(group1_layer1.cached_process_tokens, group_caches[1])
         self.assertEqual(send_thread.build_cached_process_tokens.call_count, 2)
 
+    def test_preload_align_state_keeps_attention_layerwise(self):
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import (
+            KVCacheStoreKeyLayerRecvingThread,
+        )
+
+        worker = self._make_worker()
+        worker.group_uses_align_state = [False, True]
+        attention_task = LayerTransferTask(layer_id=0, group_id=0, block_ranges=[])
+        state_task = LayerTransferTask(layer_id=0, group_id=1, block_ranges=[])
+        later_state_task = LayerTransferTask(layer_id=1, group_id=1, block_ranges=[])
+        worker.layer_load_tasks = [
+            [attention_task, state_task],
+            [later_state_task],
+        ]
+        recv_thread = object.__new__(KVCacheStoreKeyLayerRecvingThread)
+        recv_thread.preload_tasks = MagicMock()
+        worker.kv_recv_thread = recv_thread
+
+        worker._preload_align_state()
+
+        recv_thread.preload_tasks.assert_called_once_with([state_task, later_state_task])
+        self.assertFalse(attention_task.preloaded)
+
+    def test_preload_align_state_skips_gva_receiver(self):
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import (
+            KVCacheStoreLayerRecvingThread,
+        )
+
+        worker = self._make_worker()
+        worker.group_uses_align_state = [True]
+        state_task = LayerTransferTask(layer_id=0, group_id=0, block_ranges=[])
+        worker.layer_load_tasks = [
+            [state_task],
+            [],
+        ]
+        worker.kv_recv_thread = MagicMock(spec=KVCacheStoreLayerRecvingThread)
+
+        worker._preload_align_state()
+
+        self.assertFalse(state_task.preloaded)
+
     def test_process_save_for_layer_batch_skip_no_save(self):
         worker = self._make_worker()
         req = ReqMeta(req_id="r1", token_len_chunk=32, block_ids=[0, 1], block_hashes=["h0", "h1"], can_save=False)
@@ -1130,6 +1232,28 @@ class TestKVPoolWorkerProcessLayerData(unittest.TestCase):
         )
         worker._process_save_for_layer_batch([req], 0)
         self.assertEqual(len(worker.layer_save_tasks[0]), 0)
+
+    def test_align_state_skips_unaligned_forward_state(self):
+        worker = self._make_worker()
+        worker.num_kv_cache_groups = 2
+        worker.grouped_block_size = [16, 16]
+        worker.group_uses_align_state = [False, True]
+        req = ReqMeta(
+            req_id="r1",
+            token_len_chunk=16,
+            save_start_token=0,
+            save_end_token=16,
+            target_token_len=20,
+            block_ids_by_group=[[1], [2]],
+            block_hashes=["h0"],
+            can_save=True,
+        )
+
+        worker._process_save_for_layer_batch([req], 0, group_id=0)
+        worker._process_save_for_layer_batch([req], 0, group_id=1)
+
+        self.assertEqual(len(worker.layer_save_tasks[0]), 1)
+        self.assertEqual(worker.layer_save_tasks[0][0].group_id, 0)
 
     def test_process_load_for_layer_batch_skips(self):
         for load_spec in (None, LoadSpec(0, 0, can_load=False, token_len=0)):

@@ -117,6 +117,7 @@ class TestKeyLayerHybridTransfer(unittest.TestCase):
             block_ids_by_group=[[3, 4], [5]],
             block_hashes=["h0", "h1"],
             is_last_chunk=True,
+            event_id=41,
         )
 
     def _make_tasks(self, request):
@@ -158,7 +159,7 @@ class TestKeyLayerHybridTransfer(unittest.TestCase):
         tasks = self._make_tasks(request)
         for task in tasks:
             task.cached_process_tokens = thread.build_cached_process_tokens(task)
-            thread.add_stored_request(request.req_id)
+            thread.add_stored_request(request.req_id, request.event_id)
 
         thread._handle_request(tasks)
 
@@ -173,6 +174,7 @@ class TestKeyLayerHybridTransfer(unittest.TestCase):
         self.assertIn("@layer_id:0@", keys[2])
         self.assertEqual(addrs, [[2300], [2400], [4000, 5000]])
         self.assertEqual(sizes, [[160], [160], [64, 32]])
+        self.assertEqual(thread.get_completed_events(), {41: 1})
 
     def test_load_batches_multiple_groups_with_group_local_layers(self):
         store = FakeStore()
@@ -207,6 +209,36 @@ class TestKeyLayerHybridTransfer(unittest.TestCase):
         self.assertIn("@layer_id:0@", keys[2])
         self.assertEqual(addrs, [[2300], [2400], [4000, 5000]])
         self.assertEqual(sizes, [[160], [160], [64, 32]])
+
+    def test_preloaded_state_task_is_not_loaded_twice(self):
+        store = FakeStore()
+        database = HybridFakeTokenDatabase()
+        load_events = [threading.Event(), threading.Event()]
+        thread = KVCacheStoreKeyLayerRecvingThread(
+            store,
+            database,
+            [16, 32],
+            tp_rank=0,
+            tp_size=1,
+            dcp_size=1,
+            ready_event=threading.Event(),
+            get_event=threading.Event(),
+            layer_load_finished_events=load_events,
+            layer_save_finished_events=[threading.Event(), threading.Event()],
+            num_layers=2,
+        )
+        thread.request_queue.task_done = MagicMock()
+        request = self._make_request()
+        state_task = self._make_tasks(request)[1]
+
+        thread.preload_tasks([state_task])
+
+        self.assertTrue(state_task.preloaded)
+        self.assertEqual(len(store.get_calls), 1)
+        thread._handle_request(LayerLoadTask(None, [state_task], layer_id=1))
+        self.assertEqual(len(store.get_calls), 1)
+        self.assertTrue(load_events[1].is_set())
+        self.assertEqual(thread.get_and_clear_finished_requests(), {request.req_id})
 
     def test_aligned_mamba_layer_skips_null_state_blocks(self):
         database = HybridFakeTokenDatabase()
@@ -385,6 +417,24 @@ class TestKVTransferThread(unittest.TestCase):
         # After get, events should be cleared
         self.assertEqual(len(t.get_kv_events()), 0)
 
+    def test_completed_events_are_aggregated_and_cleared(self):
+        t, _ = self._make_thread()
+        t.record_completed_event(7)
+        t.record_completed_event(7, 2)
+        t.record_completed_event(None)
+
+        self.assertEqual(t.get_completed_events(), {7: 3})
+        self.assertIsNone(t.get_completed_events())
+
+    def test_delete_stored_request_clears_event_mapping(self):
+        t, _ = self._make_thread()
+        t.add_stored_request("r1", event_id=11, count=3)
+
+        t.delete_finished_stored_request("r1")
+
+        self.assertNotIn("r1", t.stored_requests)
+        self.assertNotIn("r1", t.stored_request_event_ids)
+
     def test_handle_request_base_noop(self):
         t, _ = self._make_thread()
         # Base class _handle_request does nothing
@@ -453,7 +503,7 @@ class TestGVALayerTransferFailures(unittest.TestCase):
             ),
             write_finish_keys=["k0"],
         )
-        thread.add_stored_request("r1")
+        thread.add_stored_request("r1", event_id=99)
         thread.request_queue.put([task])
         return thread, store, save_finished, task
 
@@ -474,6 +524,7 @@ class TestGVALayerTransferFailures(unittest.TestCase):
         thread._handle_request([task])
 
         store.batch_write_finish.assert_called_once_with(["k0"], [0])
+        self.assertEqual(thread.get_completed_events(), {99: 1})
 
 
 class TestGVALayerReceivingTaskOwnership(unittest.TestCase):

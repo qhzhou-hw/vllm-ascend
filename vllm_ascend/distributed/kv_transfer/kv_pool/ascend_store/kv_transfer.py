@@ -338,7 +338,10 @@ class KVTransferThread(threading.Thread):
         self.done_task_lock = threading.Lock()
         self.request_queue: queue.Queue[Any] = queue.Queue()
         self.stored_requests: defaultdict[str, int] = defaultdict(int)
+        self.stored_request_event_ids: dict[str, int] = {}
         self.finished_requests: set[str] = set()
+        self.completed_events_lock = threading.Lock()
+        self.completed_events: dict[int, int] = {}
         self.kv_event_lock = threading.Lock()
         self.kv_events: list[BlockStored] = []
         self._fatal_error: BaseException | None = None
@@ -386,9 +389,16 @@ class KVTransferThread(threading.Thread):
         with self.done_task_lock:
             self.finished_requests.add(req_id)
 
-    def add_stored_request(self, req_id: str):
+    def add_stored_request(self, req_id: str, event_id: int | None = None, count: int = 1):
         with self.done_task_lock:
-            self.stored_requests[req_id] += 1
+            self.stored_requests[req_id] += count
+            if event_id is not None:
+                self.stored_request_event_ids[req_id] = event_id
+
+    def delete_finished_stored_request(self, req_id: str) -> None:
+        with self.done_task_lock:
+            self.stored_requests.pop(req_id, None)
+            self.stored_request_event_ids.pop(req_id, None)
 
     def dec_stored_request(self, req_id: str):
         with self.done_task_lock:
@@ -403,6 +413,39 @@ class KVTransferThread(threading.Thread):
                 del self.stored_requests[req_id]
                 return True
             return False
+
+    def complete_stored_request_part(self, req_id: str) -> bool:
+        """Complete one layerwise save task and publish its scheduler event.
+
+        Layerwise requests register all of their save tasks before model
+        execution.  This makes the transition to zero mean that every layer
+        that uses the request's HBM blocks has finished copying them.
+        """
+        event_id = None
+        with self.done_task_lock:
+            if req_id not in self.stored_requests:
+                return False
+            self.stored_requests[req_id] -= 1
+            if self.stored_requests[req_id] != 0:
+                return False
+            del self.stored_requests[req_id]
+            event_id = self.stored_request_event_ids.pop(req_id, None)
+        self.record_completed_event(event_id)
+        return True
+
+    def record_completed_event(self, event_id: int | None, count: int = 1) -> None:
+        if event_id is None:
+            return
+        with self.completed_events_lock:
+            self.completed_events[event_id] = self.completed_events.get(event_id, 0) + count
+
+    def get_completed_events(self) -> dict[int, int] | None:
+        with self.completed_events_lock:
+            if not self.completed_events:
+                return None
+            completed_events = self.completed_events.copy()
+            self.completed_events.clear()
+        return completed_events
 
     @staticmethod
     def _split_transfer_packets(
@@ -633,8 +676,6 @@ class KVCacheStoreSendingThread(KVTransferThread):
         self.kv_role = kv_role
         self.group_uses_align_state = group_uses_align_state or []
         self.enable_kv_event = enable_kv_event
-        self.completed_events_lock = threading.Lock()
-        self.completed_events: dict[int, int] = {}
         self.worker = worker
 
     def is_stored_request(self, req_id: str) -> bool:
@@ -648,14 +689,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
     def delete_finished_stored_request(self, req_id: str):
         with self.done_task_lock:
             self.stored_requests.pop(req_id, None)
-
-    def get_completed_events(self):
-        if not self.completed_events:
-            return None
-        with self.completed_events_lock:
-            completed_events = self.completed_events.copy()
-            self.completed_events.clear()
-        return completed_events
+            self.stored_request_event_ids.pop(req_id, None)
 
     def _handle_request_exception(self, request_data: Any):
         req_id = getattr(request_data, "req_id", None)
@@ -678,9 +712,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 if remaining == 0:
                     self.delete_finished_stored_request(req_id)
                     self.set_finished_request(req_id)
-                if req_meta.event_id is not None:
-                    with self.completed_events_lock:
-                        self.completed_events[req_meta.event_id] = 1
+                self.record_completed_event(req_meta.event_id)
                 self.request_queue.task_done()
             return
 
@@ -699,9 +731,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
             if tracked_request and remaining == 0:
                 self.delete_finished_stored_request(req_id)
                 self.set_finished_request(req_id)
-            if req_meta.event_id is not None:
-                with self.completed_events_lock:
-                    self.completed_events[req_meta.event_id] = 1
+            self.record_completed_event(req_meta.event_id)
             self.request_queue.task_done()
 
     def _handle_stored_request(self, req_meta: ReqMeta):
@@ -1169,9 +1199,6 @@ class KVCacheStoreKeyLayerSendingThread(KVTransferThread):
                     addr_list.append(addr)
                     size_list.append(size)
 
-        for req_id in req_ids:
-            self.dec_stored_request(req_id)
-
         if key_list:
             exists_states = self.lookup(key_list)
             missing_indices = [index for index, exists in enumerate(exists_states) if not exists]
@@ -1182,9 +1209,9 @@ class KVCacheStoreKeyLayerSendingThread(KVTransferThread):
                 self.sync_save_events[layer_id].synchronize()
                 self.m_store.put(keys_to_put, addrs_to_put, sizes_to_put)
 
-        if layer_id == self.final_layer_id:
-            for req_id, is_last_chunk in zip(req_ids, is_last_chunks):
-                if is_last_chunk and self.try_finish_and_delete_stored_request(req_id):
+        for req_id, is_last_chunk in zip(req_ids, is_last_chunks):
+            if self.complete_stored_request_part(req_id):
+                if is_last_chunk:
                     self.set_finished_request(req_id)
 
         assert not self.layer_save_finished_events[layer_id].is_set(), f"thread: {layer_id} save failed "
@@ -1230,24 +1257,22 @@ class KVCacheStoreKeyLayerRecvingThread(KVTransferThread):
         logger.debug("Key-based layer save event cleared: layer %d", layer_id)
         self.layer_save_finished_events[layer_id].clear()
 
-    def _handle_request(  # type: ignore[override]
-        self, data: LayerLoadTask
-    ):
-        wait_for_save = data.wait_for_save_layer
-        layer_id = data.layer_id
-        if wait_for_save is not None:
-            self._wait_for_save(wait_for_save)
+    def preload_tasks(self, transfer_tasks: list[LayerTransferTask]) -> None:
+        """Synchronously restore recurrent-state tasks before model forward."""
+        self._load_transfer_tasks(transfer_tasks)
+        for transfer_task in transfer_tasks:
+            transfer_task.preloaded = True
 
-        if data.attention_start_gate is not None:
-            while not data.attention_start_gate.wait(timeout=10):
-                logger.info("Layerwise %d load waits for attention compute start", layer_id)
-
+    def _load_transfer_tasks(
+        self, transfer_tasks: list[LayerTransferTask]
+    ) -> tuple[list[str], list[bool | None]]:
+        """Load a key-based batch and return its request completion metadata."""
         key_list = []
         addr_list = []
         size_list = []
         req_ids = []
         is_last_chunks = []
-        for transfer_task in data.transfer_tasks:
+        for transfer_task in transfer_tasks:
             group_id = transfer_task.group_id
             layer_idx_in_group = transfer_task.layer_idx_in_group
             group_block_size = self._get_block_size(group_id)
@@ -1261,6 +1286,8 @@ class KVCacheStoreKeyLayerRecvingThread(KVTransferThread):
                 request = block_range.request
                 req_ids.append(request.req_id)
                 is_last_chunks.append(request.is_last_chunk)
+                if transfer_task.preloaded:
+                    continue
                 group_block_hashes = get_block_hashes(
                     request.block_hashes,
                     group_block_size,
@@ -1281,7 +1308,7 @@ class KVCacheStoreKeyLayerRecvingThread(KVTransferThread):
                     ).split_layers(group_num_layers)[layer_idx_in_group]
                     start = block_index * group_block_size
                     end = start + group_block_size
-                    addr, size, _ = self.token_database.prepare_value_layer(
+                    addr, size, block_id = self.token_database.prepare_value_layer(
                         start,
                         end,
                         block_ids,
@@ -1298,6 +1325,21 @@ class KVCacheStoreKeyLayerRecvingThread(KVTransferThread):
             addr_list_c = _circular_shift(addr_list, shift)
             size_list_c = _circular_shift(size_list, shift)
             self.m_store.get(key_list_c, addr_list_c, size_list_c)
+        return req_ids, is_last_chunks
+
+    def _handle_request(  # type: ignore[override]
+        self, data: LayerLoadTask
+    ):
+        wait_for_save = data.wait_for_save_layer
+        layer_id = data.layer_id
+        if wait_for_save is not None:
+            self._wait_for_save(wait_for_save)
+
+        if data.attention_start_gate is not None:
+            while not data.attention_start_gate.wait(timeout=10):
+                logger.info("Layerwise %d load waits for attention compute start", layer_id)
+
+        req_ids, is_last_chunks = self._load_transfer_tasks(data.transfer_tasks)
 
         if layer_id == self.final_layer_id:
             for req_id, is_last_chunk in zip(req_ids, is_last_chunks):
@@ -1359,8 +1401,8 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
 
     def delete_finished_stored_request(self, req_id: str):
         with self.done_task_lock:
-            if req_id in self.stored_requests:
-                del self.stored_requests[req_id]
+            self.stored_requests.pop(req_id, None)
+            self.stored_request_event_ids.pop(req_id, None)
 
     def build_shared_data(self, task: LayerTransferTask) -> SharedBlockData | None:
         """Pre-compute shared block data for all layers (GVA path)."""
@@ -1392,7 +1434,6 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
             builder = self.group_builders[task.group_id] if self.group_builders else self.layer_batch_builder
             req_meta = builder.build_addrs(shared, task.layer_idx_in_group)
             for req_id in req_meta.req_ids:
-                self.dec_stored_request(req_id)
                 all_req_ids.append(req_id)
             all_save_keys.extend(shared.save_keys)
             write_finish_keys.extend(task.write_finish_keys)
@@ -1428,7 +1469,7 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
                         f"expected={len(finish_keys)}, results={finish_results}"
                     )
             for req_id in all_req_ids:
-                if self.try_finish_and_delete_stored_request(req_id):
+                if self.complete_stored_request_part(req_id):
                     self.set_finished_request(req_id)
         if not has_any_save:
             assert not self.layer_save_finished_events[physical_layer].is_set(), (

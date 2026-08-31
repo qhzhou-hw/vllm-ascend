@@ -319,6 +319,14 @@ class ChunkedTokenDatabase:
         self._key_prefix_cache: dict[tuple[int, str, str], str] = {}
         self.cache_coordinator: Any | None = None
 
+    def set_group_cache_families(
+        self,
+        group_cache_families: dict[int, str],
+        cache_role: str = "kv",
+    ) -> None:
+        self.group_cache_families[cache_role] = group_cache_families.copy()
+        self._key_prefix_cache.clear()
+
     def _get_key_prefix(
         self,
         kv_cache_group_id: int,
@@ -424,8 +432,7 @@ class ChunkedTokenDatabase:
             self.group_block_stride = group_block_stride or {}
             self.group_layer_cache_entry_offsets = group_layer_cache_entry_offsets or {}
         if group_cache_families is not None:
-            self.group_cache_families[cache_role] = group_cache_families.copy()
-            self._key_prefix_cache.clear()
+            self.set_group_cache_families(group_cache_families, cache_role)
         if group_num_layers is not None:
             self.group_num_layers[cache_role] = group_num_layers.copy()
 
@@ -890,6 +897,7 @@ class ReqMeta:
 
     current_event: torch.npu.Event | None = None
     kv_cache_group_ids: list[int] | None = None
+    kv_cache_group_families: list[str] | None = None
     skip_null_blocks_by_group: list[bool] | None = None
     num_prompt_tokens: int | None = None
 
@@ -911,6 +919,7 @@ class ReqMeta:
         is_last_chunk: bool | None = None,
         current_event: torch.npu.Event | None = None,
         kv_cache_group_ids: list[int] | None = None,
+        kv_cache_group_families: list[str] | None = None,
         skip_null_blocks_by_group: list[bool] | None = None,
         num_prompt_tokens: int | None = None,
         token_ids: list[int] | None = None,
@@ -949,6 +958,7 @@ class ReqMeta:
         self.is_last_chunk = is_last_chunk
         self.current_event = current_event
         self.kv_cache_group_ids = kv_cache_group_ids
+        self.kv_cache_group_families = kv_cache_group_families
         self.skip_null_blocks_by_group = skip_null_blocks_by_group
         self.num_prompt_tokens = num_prompt_tokens
         self.token_ids = token_ids
@@ -1099,6 +1109,7 @@ class ReqMeta:
             else None,
             gva_block_offset=tracker.gva_block_offset,
             kv_cache_group_ids=list(range(len(tracker.allocated_block_ids_by_group))),
+            kv_cache_group_families=kv_cache_group_families,
         )
 
 
@@ -1163,6 +1174,11 @@ class LayerTransferTask:
     # Cache for KVCacheStoreKeyLayerSendingThread:
     # maps block_range index -> list of (start, end, key_all_layers)
     cached_process_tokens: dict[int, list[tuple[int, int, list]]] | None = None
+    # Align-mode recurrent state must be restored before the runner copies the
+    # checkpoint into the running state slot.  Keep the task in the
+    # layer pipeline after the eager restore so normal completion accounting
+    # still happens, but do not issue the backend get twice.
+    preloaded: bool = False
 
 
 @dataclass

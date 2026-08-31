@@ -621,6 +621,31 @@ class TestKVPoolSchedulerGetStoreLookupHitTokens(unittest.TestCase):
         self.assertTrue(all("@group:0@" in key for key in group0_keys))
         self.assertTrue(all("@group:1@" in key for key in group1_keys))
 
+    def test_hybrid_layerwise_align_mamba_uses_latest_state(self):
+        scheduler = self._make_scheduler()
+        scheduler.use_layerwise = True
+        scheduler.use_hybrid = True
+        scheduler.kv_cache_group_ids = [0, 1]
+        scheduler.mamba_group_ids = [1]
+        scheduler.grouped_block_size = [16, 16]
+        scheduler.hash_block_size = 16
+        scheduler.cache_transfer_granularity = 16
+        scheduler.group_num_layers = [1, 2]
+        scheduler.store_scheduler.batch_is_exist.side_effect = [
+            [1, 1, 1, 1],
+            [0, 0, 0, 0, 0, 0, 1, 1],
+        ]
+        request = MagicMock(request_id="r1", block_hashes=[b"h0", b"h1", b"h2", b"h3"])
+
+        result = scheduler._get_store_lookup_hit_tokens(
+            request,
+            token_len=64,
+            num_computed_tokens=0,
+            include_layers=True,
+        )
+
+        self.assertEqual(result, 64)
+
 
 class TestKVPoolSchedulerFloorGranularity(unittest.TestCase):
     """Test _floor_to_cache_transfer_granularity."""
