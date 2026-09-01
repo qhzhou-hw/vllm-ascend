@@ -36,16 +36,9 @@ def _circular_shift(lst: list, offset: int) -> list:
     return lst[offset:] + lst[:offset]
 
 
-def _is_null_state_block(req_meta: ReqMeta, group_id: int, block_id: int) -> bool:
-    """Whether ``block_id`` is the null slot of an aligned state group.
-
-    Mamba ``align`` block tables retain logical positions for the full prefix,
-    but all positions except the live recurrent-state checkpoint point at the
-    reserved null block (block 0).  Layerwise transfers must not publish or
-    restore those placeholders.
-    """
-    skip_flags = req_meta.skip_null_blocks_by_group
-    return skip_flags is not None and group_id < len(skip_flags) and skip_flags[group_id] and block_id <= 0
+def _is_null_block(block_id: int) -> bool:
+    """Whether ``block_id`` is vLLM's reserved null-block placeholder."""
+    return block_id <= 0
 
 
 class LayerBatchBuilder:
@@ -815,6 +808,10 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 shard_size=self.put_step if pre_shard else None,
             )
             for start, end, key, block_hash, block_id in iterator:
+                # Match vLLM MooncakeStore: keep sharding based on the logical
+                # candidate sequence, then reject unavailable physical blocks.
+                if _is_null_block(block_id):
+                    continue
                 starts.append(start)
                 ends.append(end)
                 keys.append(key)
@@ -984,6 +981,8 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                     chunk_filter=chunk_filter,
                 )
                 for start, end, key, _block_hash, block_id in token_iter:
+                    if _is_null_block(block_id):
+                        continue
                     addr, size, block_id = self._prepare_value(
                         start,
                         end,
@@ -1193,7 +1192,7 @@ class KVCacheStoreKeyLayerSendingThread(KVTransferThread):
                         layer_idx_in_group,
                         kv_cache_group_id=group_id,
                     )
-                    if _is_null_state_block(request, group_id, block_id):
+                    if _is_null_block(block_id):
                         continue
                     key_list.append(key.to_string())
                     addr_list.append(addr)
@@ -1298,7 +1297,7 @@ class KVCacheStoreKeyLayerRecvingThread(KVTransferThread):
                     if block_index >= len(group_block_hashes):
                         continue
                     block_id = block_ids[block_index] if block_index < len(block_ids) else 0
-                    if _is_null_state_block(request, group_id, block_id):
+                    if _is_null_block(block_id):
                         continue
                     block_hash = group_block_hashes[block_index]
                     chunk_hash = block_hash if isinstance(block_hash, str) else block_hash.hex()

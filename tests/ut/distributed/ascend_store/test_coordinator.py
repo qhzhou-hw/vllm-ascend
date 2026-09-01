@@ -186,6 +186,20 @@ class TestAscendStoreCoordinator(unittest.TestCase):
 
         self.assertEqual(masks, ([False, False, False, True],))
 
+    def test_swa_reachability_is_not_disabled_by_compressed_family(self):
+        coord = AscendStoreCoordinator(
+            [KVCacheGroupSpec(["model.layers.0.swa_cache"], _sliding_spec(128, 256))],
+            scheduler_block_size=512,
+            hash_block_size=128,
+            group_block_sizes=[128],
+            group_cache_families=["c4"],
+        )
+
+        (mask,) = coord.store_mask(512)
+
+        self.assertTrue(any(mask))
+        self.assertFalse(all(mask))
+
     def test_lookup_mask_uses_reachability_without_retention(self):
         coord = AscendStoreCoordinator(
             [KVCacheGroupSpec(["layer.0"], _sliding_spec(block_size=128, sliding_window=256))],

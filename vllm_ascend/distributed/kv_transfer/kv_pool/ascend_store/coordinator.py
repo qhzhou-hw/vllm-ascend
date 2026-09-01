@@ -82,6 +82,8 @@ class AscendStoreCoordinator:
         self.use_eagle = use_eagle
         self.retention_interval = retention_interval
         self.group_block_sizes = group_block_sizes
+        # Cache families are part of AscendStore's key namespace only. Cache
+        # reachability must always come from the group's vLLM KVCacheSpec.
         self.group_cache_families = group_cache_families
         self.group_effective_block_sizes = list(group_block_sizes)
         for effective_block_size in self.group_effective_block_sizes:
@@ -171,9 +173,6 @@ class AscendStoreCoordinator:
         masks: list[tuple[int, list[bool] | None]] = []
         for group_id, spec in enumerate(self.group_effective_specs):
             num_chunks = aligned_token_len // self.group_effective_block_sizes[group_id]
-            if not _uses_reachable_mask(self.group_cache_families[group_id]):
-                masks.append((num_chunks, None))
-                continue
             manager_cls = _get_manager_class(_unwrap_spec(self.kv_cache_groups[group_id].kv_cache_spec))
             mask = _reachable_block_mask(
                 manager_cls,
@@ -384,7 +383,3 @@ def _reachable_block_mask(
         kwargs.pop("retention_interval", None)
         kwargs.pop("num_prompt_tokens", None)
         return reachable_block_mask(**kwargs)
-
-
-def _uses_reachable_mask(cache_family: str | None) -> bool:
-    return cache_family in (None, "default", "c1")

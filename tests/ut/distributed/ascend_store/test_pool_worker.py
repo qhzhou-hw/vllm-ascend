@@ -122,6 +122,24 @@ class TestKVPoolWorkerHelpers(unittest.TestCase):
                 result = cls.find_all_continuous_hit_positions(exists, positions, count, 48, 16)
                 self.assertEqual(result, expected)
 
+    def test_layerwise_ranges_only_include_manager_reachable_blocks(self):
+        cls = self._make_worker_class()
+        request = ReqMeta(req_id="dsv4", block_ids=[1, 2, 3, 4, 5])
+
+        ranges = cls._build_masked_block_ranges(
+            request,
+            start_block=0,
+            end_block=5,
+            partial_block_index=None,
+            group_id=1,
+            masks=([True] * 5, [False, True, True, False, True]),
+        )
+
+        self.assertEqual(
+            [(block_range.start_block, block_range.end_block) for block_range in ranges],
+            [(1, 3), (4, 5)],
+        )
+
     def test_sync_group_cache_families_uses_scheduler_values(self):
         cls = self._make_worker_class()
         worker = cls.__new__(cls)
@@ -660,7 +678,7 @@ class TestKVPoolWorkerRegisterAndTransfer(unittest.TestCase):
         req = ReqMeta(
             req_id="r1",
             token_len_chunk=16,
-            block_ids=[0],
+            block_ids=[1],
             block_hashes=["h0"],
             load_spec=load_spec,
         )
@@ -699,9 +717,9 @@ class TestKVPoolWorkerRegisterAndTransfer(unittest.TestCase):
 
     def test_start_load_kv(self):
         cases = [
-            (16, [0], ["h0"], LoadSpec(0, 16, True, token_len=16), True),
+            (16, [1], ["h0"], LoadSpec(0, 16, True, token_len=16), True),
             (64, [99], ["h0", "h1", "h2", "h3"], LoadSpec(0, 64, True, token_len=64), True),
-            (16, [0], ["h0"], None, False),
+            (16, [1], ["h0"], None, False),
         ]
         for token_len, block_ids, hashes, load_spec, should_load in cases:
             with self.subTest(token_len=token_len, block_ids=block_ids, load_spec=load_spec):
@@ -1233,6 +1251,31 @@ class TestKVPoolWorkerProcessLayerData(unittest.TestCase):
         worker._process_save_for_layer_batch([req], 0)
         self.assertEqual(len(worker.layer_save_tasks[0]), 0)
 
+    def test_mooncake_layerwise_save_uses_group_reachability_mask(self):
+        worker = self._make_worker()
+        worker.token_database.store_mask = MagicMock(
+            return_value=([False, True, True, False, True],)
+        )
+        request = ReqMeta(
+            req_id="dsv4-swa-save",
+            token_len_chunk=80,
+            save_start_token=0,
+            save_end_token=80,
+            target_token_len=80,
+            block_ids=[1, 2, 3, 4, 5],
+            block_hashes=["h0", "h1", "h2", "h3", "h4"],
+            can_save=True,
+        )
+
+        worker._process_save_for_layer_batch([request], 0)
+
+        ranges = worker.layer_save_tasks[0][0].block_ranges
+        self.assertEqual(
+            [(block_range.start_block, block_range.end_block) for block_range in ranges],
+            [(1, 3), (4, 5)],
+        )
+        worker.token_database.store_mask.assert_called_once_with(80, None)
+
     def test_align_state_skips_unaligned_forward_state(self):
         worker = self._make_worker()
         worker.num_kv_cache_groups = 2
@@ -1317,6 +1360,33 @@ class TestKVPoolWorkerProcessLayerData(unittest.TestCase):
 
         load_range = worker.layer_load_tasks[0][0].block_ranges[0]
         self.assertEqual((load_range.start_block, load_range.end_block), (0, 2))
+
+    def test_mooncake_layerwise_load_uses_group_reachability_mask(self):
+        worker = self._make_worker()
+        worker.token_database.load_mask = MagicMock(
+            return_value=([False, True, True, False, True],)
+        )
+        request = ReqMeta(
+            req_id="dsv4-swa-load",
+            token_len_chunk=80,
+            block_ids=[1, 2, 3, 4, 5],
+            block_hashes=["h0", "h1", "h2", "h3", "h4"],
+            load_spec=LoadSpec(
+                vllm_cached_tokens=0,
+                kvpool_cached_tokens=80,
+                can_load=True,
+                token_len=80,
+            ),
+        )
+
+        worker._process_load_for_layer_batch([request], 0)
+
+        ranges = worker.layer_load_tasks[0][0].block_ranges
+        self.assertEqual(
+            [(block_range.start_block, block_range.end_block) for block_range in ranges],
+            [(1, 3), (4, 5)],
+        )
+        worker.token_database.load_mask.assert_called_once_with(request.block_hashes, 80)
 
     def test_mtp_load_uses_safe_extent_not_store_skip_extent(self):
         worker = self._make_worker()

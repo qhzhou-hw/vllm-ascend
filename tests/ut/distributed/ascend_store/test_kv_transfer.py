@@ -240,7 +240,7 @@ class TestKeyLayerHybridTransfer(unittest.TestCase):
         self.assertTrue(load_events[1].is_set())
         self.assertEqual(thread.get_and_clear_finished_requests(), {request.req_id})
 
-    def test_aligned_mamba_layer_skips_null_state_blocks(self):
+    def test_layerwise_skips_null_blocks_for_all_cache_groups(self):
         database = HybridFakeTokenDatabase()
         request = ReqMeta(
             req_id="qwen35",
@@ -249,7 +249,9 @@ class TestKeyLayerHybridTransfer(unittest.TestCase):
             block_ids_by_group=[[3, 4, 5, 6], [0, 7]],
             block_hashes=["h0", "h1", "h2", "h3"],
             is_last_chunk=True,
-            skip_null_blocks_by_group=[False, True],
+            # SWA null placeholders can occur in a non-Mamba cache family.
+            # Correctness must not depend on the aligned-state hint.
+            skip_null_blocks_by_group=[False, False],
         )
         save_task = LayerTransferTask(
             layer_id=1,
@@ -704,7 +706,7 @@ class TestKVCacheStoreSendingThread(unittest.TestCase):
                 req = ReqMeta(
                     req_id="r1",
                     token_len_chunk=16 * len(exists),
-                    block_ids=list(range(len(exists))),
+                    block_ids=list(range(1, len(exists) + 1)),
                     block_hashes=[f"h{i}" for i in range(len(exists))],
                     current_event=None,
                 )
@@ -721,7 +723,7 @@ class TestKVCacheStoreSendingThread(unittest.TestCase):
         req = ReqMeta(
             req_id="r1",
             token_len_chunk=16,
-            block_ids=[0],
+            block_ids=[1],
             block_hashes=[b"h0"],  # type: ignore[arg-type]
             current_event=None,
             token_ids=list(range(16)),
@@ -752,7 +754,7 @@ class TestKVCacheStoreSendingThread(unittest.TestCase):
         req = ReqMeta(
             req_id="r1",
             token_len_chunk=16,
-            block_ids=[0],
+            block_ids=[1],
             block_hashes=[b"h0"],  # type: ignore[arg-type]
             current_event=event,
         )
@@ -777,7 +779,7 @@ class TestKVCacheStoreSendingThread(unittest.TestCase):
         req = ReqMeta(
             req_id="r1",
             token_len_chunk=32,
-            block_ids=[0, 1],
+            block_ids=[2, 3],
             block_hashes=[b"h0", b"h1"],  # type: ignore[arg-type]
             current_event=None,
         )
@@ -804,7 +806,7 @@ class TestKVCacheStoreSendingThread(unittest.TestCase):
         req = ReqMeta(
             req_id="r1",
             token_len_chunk=32,
-            block_ids=[0, 1],
+            block_ids=[2, 3],
             block_hashes=[b"h0", b"h1"],  # type: ignore[arg-type]
             current_event=None,
         )
@@ -813,6 +815,35 @@ class TestKVCacheStoreSendingThread(unittest.TestCase):
         t._handle_request(req)
         keys, _, _ = store.put_calls[0]
         self.assertEqual(len(keys), 1)
+
+    def test_handle_request_skips_null_block_after_candidate_selection(self):
+        store = FakeStore([0])
+        db = MaskedFakeTokenDatabase(masks=([True, True],))
+        t = KVCacheStoreSendingThread(
+            m_store=store,
+            token_database=db,
+            block_size=16,
+            tp_rank=0,
+            dcp_size=1,
+            put_step=1,
+            kv_role="kv_producer",
+            ready_event=threading.Event(),
+            group_uses_align_state=[False],
+        )
+        req = ReqMeta(
+            req_id="swa",
+            token_len_chunk=32,
+            block_ids=[0, 7],
+            block_hashes=[b"h0", b"h1"],  # type: ignore[arg-type]
+        )
+        t.add_stored_request(req.req_id)
+        t.request_queue.put(req)
+
+        t._handle_request(req)
+
+        keys, addrs, _ = store.put_calls[0]
+        self.assertEqual(len(keys), 1)
+        self.assertEqual(addrs, [[1007]])
 
     def test_handle_request_skips_compressed_hit_in_raw_token_domain(self):
         t, store = self._make_thread([0, 0], block_size=64)
@@ -897,7 +928,7 @@ class TestKVCacheStoreRecvingThread(unittest.TestCase):
         req = ReqMeta(
             req_id="r1",
             token_len_chunk=32,
-            block_ids=[0, 1],
+            block_ids=[2, 3],
             block_hashes=[b"h0", b"h1"],  # type: ignore[arg-type]
             load_spec=load_spec,
         )

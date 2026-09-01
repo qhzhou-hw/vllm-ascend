@@ -855,6 +855,8 @@ class KVPoolWorker:
     def start_load_kv(self, metadata: AscendConnectorMetadata):
         self.current_layer = 0
         self.layerwise_retrievers: list[Any] = []
+        self._layerwise_store_mask_cache: dict[tuple[int, int], tuple[list[bool], ...] | None] = {}
+        self._layerwise_load_mask_cache: dict[tuple[int, int], tuple[list[bool], ...] | None] = {}
         if self.use_layerwise:
             self.next_layer_to_submit = 0
             # Transfer threads receive these lists by reference. Give every
@@ -944,6 +946,8 @@ class KVPoolWorker:
                     skip_null_blocks=skip_null,
                     chunk_filter=chunk_filter,
                 ):
+                    if block_id <= 0:
+                        continue
                     addr, size, block_id = self.token_database.prepare_value(
                         start,
                         end,
@@ -1066,12 +1070,22 @@ class KVPoolWorker:
                 partial_block_index = request.partial_block_index
             if save_start_block >= save_end_block and partial_block_index is None:
                 continue
-            request_block_ranges.append(
-                LayerBlockRange(
-                    request=request,
-                    start_block=save_start_block,
-                    end_block=save_end_block,
-                    partial_block_index=partial_block_index,
+            # GVA-based MemCache allocates and publishes contiguous blobs in a
+            # separate preparation phase. Sparse per-spec ranges are currently
+            # supported by the key-based Mooncake layerwise path only.
+            store_masks = (
+                None
+                if self.use_gva_layerwise
+                else self._get_layerwise_masks(request, request.save_end_token, is_save=True)
+            )
+            request_block_ranges.extend(
+                self._build_masked_block_ranges(
+                    request,
+                    save_start_block,
+                    save_end_block,
+                    partial_block_index,
+                    group_id,
+                    store_masks,
                 )
             )
         if request_block_ranges:
@@ -1136,12 +1150,19 @@ class KVPoolWorker:
                 partial_block_index = None
             if load_start_block >= full_blocks and partial_block_index is None:
                 continue
-            request_block_ranges.append(
-                LayerBlockRange(
-                    request=request,
-                    start_block=load_start_block,
-                    end_block=full_blocks,
-                    partial_block_index=partial_block_index,
+            load_masks = (
+                None
+                if self.use_gva_layerwise
+                else self._get_layerwise_masks(request, cached_tokens, is_save=False)
+            )
+            request_block_ranges.extend(
+                self._build_masked_block_ranges(
+                    request,
+                    load_start_block,
+                    full_blocks,
+                    partial_block_index,
+                    group_id,
+                    load_masks,
                 )
             )
         if request_block_ranges:
@@ -1153,6 +1174,76 @@ class KVPoolWorker:
                     layer_idx_in_group=layer_idx_in_group,
                 )
             )
+
+    def _get_layerwise_masks(
+        self,
+        request: ReqMeta,
+        token_len: int,
+        *,
+        is_save: bool,
+    ) -> tuple[list[bool], ...] | None:
+        """Compute per-spec masks once per request and layerwise step."""
+        cache_name = "_layerwise_store_mask_cache" if is_save else "_layerwise_load_mask_cache"
+        cache: dict[tuple[int, int], tuple[list[bool], ...] | None] = getattr(self, cache_name, None)
+        if cache is None:
+            cache = {}
+            setattr(self, cache_name, cache)
+        cache_key = (id(request), token_len)
+        if cache_key in cache:
+            return cache[cache_key]
+        try:
+            masks = (
+                self.token_database.store_mask(token_len, request.num_prompt_tokens)
+                if is_save
+                else self.token_database.load_mask(request.block_hashes, token_len)
+            )
+        except AssertionError as exc:
+            logger.debug(
+                "Skip AscendStore layerwise %s mask for unaligned request %s: %s",
+                "store" if is_save else "load",
+                request.req_id,
+                exc,
+            )
+            masks = None
+        cache[cache_key] = masks
+        return masks
+
+    @staticmethod
+    def _build_masked_block_ranges(
+        request: ReqMeta,
+        start_block: int,
+        end_block: int,
+        partial_block_index: int | None,
+        group_id: int,
+        masks: tuple[list[bool], ...] | None,
+    ) -> list[LayerBlockRange]:
+        """Split a layerwise task into contiguous manager-reachable ranges."""
+        group_mask = masks[group_id] if masks is not None and group_id < len(masks) else None
+        ranges: list[LayerBlockRange] = []
+        run_start: int | None = None
+        for block_index in range(start_block, end_block):
+            allowed = group_mask is None or (block_index < len(group_mask) and group_mask[block_index])
+            if allowed and run_start is None:
+                run_start = block_index
+            elif not allowed and run_start is not None:
+                ranges.append(LayerBlockRange(request, run_start, block_index))
+                run_start = None
+        if run_start is not None:
+            ranges.append(LayerBlockRange(request, run_start, end_block))
+
+        if partial_block_index is not None:
+            if ranges:
+                ranges[-1].partial_block_index = partial_block_index
+            else:
+                ranges.append(
+                    LayerBlockRange(
+                        request,
+                        start_block,
+                        start_block,
+                        partial_block_index=partial_block_index,
+                    )
+                )
+        return ranges
 
     @staticmethod
     def _get_partial_block_index(
