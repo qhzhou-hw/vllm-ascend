@@ -35,6 +35,11 @@ _GROUP_BLOCK_SIZES = [16, 32]
 _NUM_LAYERS = 2
 _NUM_CACHE_BLOCKS = 4
 _SENTINEL = -123.0
+_DSV4_GROUP_BLOCK_SIZES = [128, 4096, 32, 32, 32, 2, 8]
+_DSV4_CACHE_FAMILIES = ["c4", "c128", "mixed", "mixed", "mixed", "c4", "c128"]
+_DSV4_HASH_BLOCK_SIZE = 2
+_DSV4_NUM_LAYERS = 3
+_DSV4_TOKEN_COUNT = 4096
 
 
 def _free_port() -> int:
@@ -125,9 +130,9 @@ def mooncake_store_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> It
                     process.wait(timeout=10)
 
 
-def _new_cache(block_size: int, width: int) -> torch.Tensor:
+def _new_cache(block_size: int, width: int, num_blocks: int = _NUM_CACHE_BLOCKS) -> torch.Tensor:
     return torch.empty(
-        (_NUM_CACHE_BLOCKS, block_size, width),
+        (num_blocks, block_size, width),
         dtype=torch.float16,
         device="npu",
     ).uniform_(-1.0, 1.0)
@@ -329,6 +334,187 @@ def test_mooncake_hybrid_layerwise_kv_roundtrip(mooncake_store_config: Path) -> 
                 "stored_keys": len(expected_keys),
                 **io_stats,
                 "max_abs_diff": max_abs_diff,
+                "bitwise_equal": True,
+            },
+            sort_keys=True,
+        )
+    )
+
+
+def test_mooncake_dsv4_layerwise_group_geometry_roundtrip(mooncake_store_config: Path) -> None:
+    del mooncake_store_config
+    torch.npu.set_device(0)
+    torch.manual_seed(20260901)
+
+    blocks_per_group = [_DSV4_TOKEN_COUNT // block_size for block_size in _DSV4_GROUP_BLOCK_SIZES]
+    group_caches = {
+        group_id: [
+            _new_cache(
+                block_size,
+                width=group_id + layer_id + 1,
+                num_blocks=blocks_per_group[group_id] + 2,
+            )
+            for layer_id in range(_DSV4_NUM_LAYERS)
+        ]
+        for group_id, block_size in enumerate(_DSV4_GROUP_BLOCK_SIZES)
+    }
+    torch.npu.synchronize()
+    originals = {group_id: [tensor.cpu().clone() for tensor in tensors] for group_id, tensors in group_caches.items()}
+
+    test_namespace = f"dsv4-seven-group-roundtrip-{uuid.uuid4().hex}"
+    database = ChunkedTokenDatabase(
+        [
+            KeyMetadata(
+                test_namespace,
+                0,
+                0,
+                0,
+                0,
+                kv_cache_group_id=group_id,
+                cache_family=_DSV4_CACHE_FAMILIES[group_id],
+            )
+            for group_id in range(len(_DSV4_GROUP_BLOCK_SIZES))
+        ],
+        _DSV4_GROUP_BLOCK_SIZES,
+        partitions=None,
+        hash_block_size=_DSV4_HASH_BLOCK_SIZE,
+    )
+    group_block_lengths = {
+        group_id: [_block_bytes(tensor) for tensor in tensors] for group_id, tensors in group_caches.items()
+    }
+    database.set_group_buffers(
+        {group_id: [tensor.data_ptr() for tensor in tensors] for group_id, tensors in group_caches.items()},
+        group_block_lengths,
+        group_block_stride=group_block_lengths,
+        group_num_layers={group_id: _DSV4_NUM_LAYERS for group_id in group_caches},
+        group_layer_cache_entry_offsets={group_id: list(range(_DSV4_NUM_LAYERS + 1)) for group_id in group_caches},
+    )
+
+    backend = MooncakeBackend(ParallelConfig())
+    all_caches = [tensor for tensors in group_caches.values() for tensor in tensors]
+    backend.register_buffer(
+        [tensor.data_ptr() for tensor in all_caches],
+        [tensor.numel() * tensor.element_size() for tensor in all_caches],
+    )
+    io_stats = {"put_calls": 0, "get_calls": 0, "put_bytes": 0, "get_bytes": 0}
+    real_put = backend.put
+    real_get = backend.get
+
+    def counted_put(keys: list[str], addrs: list[list[int]], sizes: list[list[int]]) -> None:
+        io_stats["put_calls"] += 1
+        io_stats["put_bytes"] += sum(sum(key_sizes) for key_sizes in sizes)
+        real_put(keys, addrs, sizes)
+
+    def counted_get(keys: list[str], addrs: list[list[int]], sizes: list[list[int]]) -> list[int] | None:
+        io_stats["get_calls"] += 1
+        io_stats["get_bytes"] += sum(sum(key_sizes) for key_sizes in sizes)
+        return real_get(keys, addrs, sizes)
+
+    backend.put = counted_put  # type: ignore[method-assign]
+    backend.get = counted_get  # type: ignore[method-assign]
+    request = ReqMeta(
+        req_id="dsv4-seven-group-roundtrip",
+        token_len_chunk=_DSV4_TOKEN_COUNT,
+        save_end_token=_DSV4_TOKEN_COUNT,
+        block_ids_by_group=[list(range(1, num_blocks + 1)) for num_blocks in blocks_per_group],
+        block_hashes=[f"dsv4-hash-{index}" for index in range(_DSV4_TOKEN_COUNT // _DSV4_HASH_BLOCK_SIZE)],
+        is_last_chunk=True,
+    )
+
+    def make_tasks(physical_layer: int) -> list[LayerTransferTask]:
+        return [
+            LayerTransferTask(
+                layer_id=physical_layer,
+                group_id=group_id,
+                layer_idx_in_group=physical_layer,
+                block_ranges=[LayerBlockRange(request, 0, blocks_per_group[group_id])],
+            )
+            for group_id in range(len(_DSV4_GROUP_BLOCK_SIZES))
+        ]
+
+    layer_save_events = [threading.Event() for _ in range(_DSV4_NUM_LAYERS)]
+    sync_save_events = [torch.npu.Event() for _ in range(_DSV4_NUM_LAYERS)]
+    for event in sync_save_events:
+        event.record()
+    sender = KVCacheStoreKeyLayerSendingThread(
+        backend,
+        database,
+        _DSV4_GROUP_BLOCK_SIZES,
+        tp_rank=0,
+        tp_size=1,
+        dcp_size=1,
+        put_step=1,
+        ready_event=threading.Event(),
+        num_layers=_DSV4_NUM_LAYERS,
+        layer_save_finished_events=layer_save_events,
+        sync_save_events=sync_save_events,
+    )
+    for physical_layer in range(_DSV4_NUM_LAYERS):
+        tasks = make_tasks(physical_layer)
+        for task in tasks:
+            task.cached_process_tokens = sender.build_cached_process_tokens(task)
+            sender.add_stored_request(request.req_id)
+        sender.request_queue.put(tasks)
+        sender._handle_request(tasks)
+
+    expected_keys = []
+    for group_id in range(len(_DSV4_GROUP_BLOCK_SIZES)):
+        for _, _, key in database.process_tokens(
+            request.save_end_token,
+            request.block_hashes,
+            kv_cache_group_id=group_id,
+        ):
+            expected_keys.extend(layer_key.to_string() for layer_key in key.split_layers(_DSV4_NUM_LAYERS))
+    assert len(expected_keys) == sum(blocks_per_group) * _DSV4_NUM_LAYERS
+    assert all(backend.exists(expected_keys))
+
+    for tensor in all_caches:
+        tensor.fill_(_SENTINEL)
+    torch.npu.synchronize()
+
+    receiver = KVCacheStoreKeyLayerRecvingThread(
+        backend,
+        database,
+        _DSV4_GROUP_BLOCK_SIZES,
+        tp_rank=0,
+        tp_size=1,
+        dcp_size=1,
+        ready_event=threading.Event(),
+        get_event=threading.Event(),
+        layer_load_finished_events=[threading.Event() for _ in range(_DSV4_NUM_LAYERS)],
+        layer_save_finished_events=[threading.Event() for _ in range(_DSV4_NUM_LAYERS)],
+        num_layers=_DSV4_NUM_LAYERS,
+    )
+    for physical_layer in range(_DSV4_NUM_LAYERS):
+        load_task = LayerLoadTask(None, make_tasks(physical_layer), layer_id=physical_layer)
+        receiver.request_queue.put(load_task)
+        receiver._handle_request(load_task)
+    torch.npu.synchronize()
+
+    for group_id, tensors in group_caches.items():
+        restored_blocks = range(1, blocks_per_group[group_id] + 1)
+        untouched_blocks = (0, blocks_per_group[group_id] + 1)
+        for cache_index, tensor in enumerate(tensors):
+            actual = tensor.cpu()
+            expected = originals[group_id][cache_index]
+            for block_id in restored_blocks:
+                assert torch.equal(actual[block_id], expected[block_id])
+            for block_id in untouched_blocks:
+                assert torch.all(actual[block_id] == _SENTINEL)
+
+    assert io_stats["put_calls"] == _DSV4_NUM_LAYERS
+    assert io_stats["get_calls"] == _DSV4_NUM_LAYERS
+    assert io_stats["put_bytes"] == io_stats["get_bytes"]
+    print(
+        json.dumps(
+            {
+                "backend": "mooncake",
+                "cache_groups": len(_DSV4_GROUP_BLOCK_SIZES),
+                "group_block_sizes": _DSV4_GROUP_BLOCK_SIZES,
+                "physical_layers": _DSV4_NUM_LAYERS,
+                "stored_keys": len(expected_keys),
+                **io_stats,
+                "max_abs_diff": 0.0,
                 "bitwise_equal": True,
             },
             sort_keys=True,
