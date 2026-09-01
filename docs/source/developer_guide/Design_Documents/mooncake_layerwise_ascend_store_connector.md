@@ -214,6 +214,15 @@ DeepSeek-V4@pcp0@dcp0@head_or_tp_rank:0@group:1@cache_role:kv@cache_family:c4@la
 `cache_family` 优先从 group 的 cache spec 推断；若 spec 没有直接给出，则结合模型
 `compress_ratios` 和 layer name 推断。DeepSeek-V4 使用自己的层号提取和压缩比逻辑。
 
+需要特别区分两个概念：
+
+- `cache_family` 只属于 AscendStore key namespace，用来避免不同压缩布局发生 key 冲突；
+- block 是否仍可能被模型读取，必须由 vLLM 的 `KVCacheSpec` 和对应 cache manager 决定。
+
+例如 DeepSeek-V4 同一个物理层中可以同时出现 compressed cache 和 sliding-window cache。
+此时 SWA group 的 key family 可能因为父层压缩比被标记为 `c4` 或 `c128`，但该 group 的
+实际 spec 仍是 `SlidingWindowSpec`。不能根据 `cache_family` 把它当作 Full Attention。
+
 ## 6. Scheduler 侧命中计算
 
 ### 6.1 为什么不能只查询一个 group
@@ -255,6 +264,84 @@ Hybrid group 的 `cache_transfer_granularity` 由相关 group block size 推导�
 
 这不是 Mooncake put/get 未执行，而是 scheduler 正确地拒绝了不完整 group 快照。
 
+### 6.4 SWA 可达性与 null block
+
+#### 问题表现
+
+vLLM 的 `SlidingWindowManager` 会释放窗口之外的物理 KV block，并在逻辑 block table 中用
+保留的 `NULL_BLOCK_ID=0` 占位。逻辑前缀长度仍然完整，但旧 SWA block 已经不可读取，也
+不应被写入或从 AscendStore 恢复。
+
+修复前存在三条绕过该语义的路径：
+
+1. `AscendStoreCoordinator._reachable_masks()` 根据 `cache_family` 决定是否调用 cache
+   manager。标记为 `c4/c128` 的 SWA group 会被错误地当作全部可达；
+2. non-layerwise 只对 Mamba align group 过滤 null block，普通 SWA group 的 block 0
+   仍可能进入 Mooncake GET/PUT；
+3. Mooncake layerwise 直接创建连续的 `[start_block, end_block)` task，没有使用 per-group
+   reachability mask，因此会为不可达 SWA block 生成逐层 key 和传输任务。
+
+该问题不是 vLLM 的 SWA block 管理错误。vLLM MooncakeStore 的处理包含两道保护：
+
+```text
+KVCacheSpec
+  -> KVCacheSpecRegistry.get_manager_class(spec)
+  -> manager.reachable_block_mask(...)
+  -> token/key candidate selection and TP sharding
+  -> skip source/destination block when block_id == NULL_BLOCK_ID
+  -> Mooncake GET/PUT
+```
+
+第一道保护减少不必要的 key 查询和数据传输；第二道保护防止异常或不完整 metadata 导致
+block 0 被作为真实地址使用。
+
+#### AscendStore 修复
+
+`AscendStoreCoordinator` 现在对每个 group 都根据实际 `KVCacheSpec` 获取 manager 并调用
+`reachable_block_mask()`。`cache_family` 不再参与 reachability 分支：
+
+```text
+FullAttentionSpec  -> FullAttentionManager    -> all blocks reachable
+SlidingWindowSpec  -> SlidingWindowManager    -> only window-reachable blocks
+MambaSpec          -> MambaManager            -> mode-specific state blocks
+```
+
+non-layerwise 路径保留正常的逻辑候选顺序，先完成 `put_step`/TP candidate selection，再在
+真正构造 Mooncake地址前统一跳过 `block_id <= 0`。过滤不能提前到 TP 分片之前，否则删除
+null block 会改变后续 key 的 rank 归属。
+
+Mooncake key-based layerwise 路径执行以下处理：
+
+1. 每个请求、每个 step 分别计算一次 store/load mask；
+2. mask 在该请求的所有物理层之间复用，避免每层重复执行 manager 推断；
+3. 把允许传输的 block 合并为连续 `LayerBlockRange`；
+4. 每个 group 只为这些 range 创建逐层 GET/PUT task；
+5. key-based sending/receiving thread 在最终地址解析后再次跳过 block 0。
+
+例如 mask 为：
+
+```text
+[False, True, True, False, True]
+```
+
+生成的 layerwise range 是：
+
+```text
+[1, 3), [4, 5)
+```
+
+而不是原来的 `[0, 5)`。
+
+#### MemCache/GVA 边界
+
+MemCache layerwise 会在独立准备阶段按连续范围分配 GVA blob，并在所有层复制完成后调用
+write-finish。若只在 layer task 阶段套用稀疏 mask，可能出现某个 blob 已分配和 publish，
+但对应 NPU 数据没有复制的问题。
+
+因此本次稀疏 `LayerBlockRange` 优化只用于 Mooncake key-based layerwise 路径。
+`use_gva_layerwise=true` 时保持既有连续 GVA 语义。后续若要优化 MemCache SWA，需要同时
+修改 GVA 分配、lease、batch-copy 和 write-finish 的 key 集合，不能只复用 task mask。
+
 ## 7. Worker 侧任务生成
 
 `process_layer_data()` 每个 step 都重新建立任务，避免异步线程仍持有上一 step 的 list：
@@ -280,6 +367,10 @@ for physical_layer in model order:
 
 同一物理层的多个 group task 会一起提交给 Mooncake layer thread。线程要求 task 的
 `layer_id` 相同，但允许包含多个 `group_id`。
+
+对于 SWA 等带稀疏 reachability 的 group，一个 request 在同一 task 中可以对应多个
+`LayerBlockRange`。Request completion 的注册计数以实际 range 数量为准，因此拆分 range
+不会提前释放 scheduler 持有的 block，也不会在最后一层之前错误地报告保存完成。
 
 ## 8. 保存路径
 
@@ -529,6 +620,10 @@ vLLM connector 配置：
 - hybrid scheduler 取所有 group 的公共命中；
 - DeepSeek-V4 indexer spec 在 block normalization 后仍保留物理 page size；
 - dummy `wo_a` 的幂等打包。
+- `c4/c128` key family 不会屏蔽 `SlidingWindowManager` 的 reachability；
+- non-layerwise 在 candidate selection 后跳过 block 0；
+- Mooncake layerwise save/load 按 group mask 拆分连续 range；
+- Mamba hint 为 false 的普通 cache group 同样不会传输 null block。
 
 测试命令：
 
@@ -541,6 +636,14 @@ python -m pytest -q \
 ```
 
 当前验证结果为 `461 passed`。
+
+本次 SWA/null-block 优化在 Ascend 测试环境额外执行了完整
+`tests/ut/distributed/ascend_store`，结果为：
+
+```text
+322 passed
+ruff: all checks passed
+```
 
 ### 12.2 真实 Mooncake NPU roundtrip
 
@@ -572,6 +675,24 @@ python -m pytest -q \
 ```
 
 这里的计数 wrapper 会继续调用真实 `MooncakeBackend.put/get`，不是 mock。
+
+DeepSeek-V4 group geometry roundtrip 使用 7 个 cache group、3 个物理层和实际 DSV4 group
+block size `[128, 4096, 32, 32, 32, 2, 8]`。随机 NPU tensor 经真实 Mooncake 保存、覆写和
+恢复后的结果为：
+
+```json
+{
+    "cache_groups": 7,
+    "physical_layers": 3,
+    "stored_keys": 8931,
+    "put_calls": 3,
+    "put_bytes": 860160,
+    "get_calls": 3,
+    "get_bytes": 860160,
+    "max_abs_diff": 0.0,
+    "bitwise_equal": true
+}
+```
 
 Kimi-K3 aligned KDA state 的独立 roundtrip 同样经过真实 Mooncake backend，conv 与
 recurrent 两个 state entry 在覆写后按位恢复：
@@ -673,6 +794,38 @@ Qwen3.5 真实 checkpoint 还进行了 HBM eviction 压力验证：同一个 vLL
 平均延迟从约 0.91 秒降至 0.38 秒。独立指纹诊断另确认目标样本 24 个 layer/group value
 均与此前保存值一致；指纹代码只用于验证，未保留在正式实现中。
 
+### 12.4 DeepSeek-V4 SWA 传输缩减
+
+使用 DeepSeek-V4 测试 config 的实际参数：
+
+```text
+sliding_window = 128
+SWA group block_size = 128
+hybrid alignment = 4096
+cache_family = c4
+```
+
+一个 4096-token 对齐段包含 32 个 SWA block。修复前 `c4` family 会绕过
+`SlidingWindowManager`，store/load mask 等价于 32 个 block 全部为 true。修复后真实 manager
+输出只保留最后一个可达 block：
+
+```text
+blocks: 32
+reachable blocks: 1
+reachable indices: [31]
+```
+
+因此该 SWA group 每个对齐段的 key 数、GET/PUT 数据量和外部存储量从 32 份降为 1 份，
+减少约 `96.9%`。这是单个 SWA group 的缩减比例，不等同于整个 DeepSeek-V4 请求的总 KV
+降低比例；Full Attention、compressed/indexer 和 recurrent-state group 仍按各自 spec
+保存必要数据。
+
+对应实现提交为：
+
+```text
+72a924474 fix(kv_pool): honor SWA reachability in AscendStore
+```
+
 ## 13. 错误处理与可观测性
 
 Mooncake backend 在 debug 日志中输出实际调用：
@@ -697,6 +850,8 @@ Hybrid load 不能把单个 group 的失败安全地回退成局部 block recomp
 ## 14. 当前限制
 
 - Mooncake layerwise 使用 key-based path，不支持 Memcache GVA 的跨层 buffer reuse。
+- 稀疏 SWA `LayerBlockRange` 当前只用于 Mooncake key-based layerwise；MemCache/GVA 仍使用
+  连续分配和 publish 语义。
 - Mamba/SSM state 仅支持 `mamba_cache_mode=align`，已覆盖 Qwen3.5 GDN 与 Kimi-K3 KDA。
 - Kimi-K3 RecoverSSM、DSpark 和 CP 尚未纳入 layerwise 支持范围。
 - Layerwise 与 CP backend 尚未完成统一支持。
