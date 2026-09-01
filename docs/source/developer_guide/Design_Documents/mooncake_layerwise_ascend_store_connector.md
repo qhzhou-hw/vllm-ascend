@@ -822,6 +822,49 @@ Qwen3.5 真实 checkpoint 还进行了 HBM eviction 压力验证：同一个 vLL
 平均延迟从约 0.91 秒降至 0.38 秒。独立指纹诊断另确认目标样本 24 个 layer/group value
 均与此前保存值一致；指纹代码只用于验证，未保留在正式实现中。
 
+#### Qwen3.5 LongBench 50 请求准确率压力测试
+
+在 2026-09-01 的 Ascend 910B2C 环境中，使用真实 BF16
+`Qwen3.5-0.8B` checkpoint 对 LongBench `qasper` 前 50 个样本进行了更大规模的冷/热
+重复请求测试。输入长度为 2529 到 18035 tokens，平均 5652.06 tokens，其中 5 个样本
+超过 8192 tokens；服务参数包括 `max_model_len=20480`、`block_size=128`、
+`mamba_cache_mode=align`、`enforce_eager=true` 和 `enable_prefix_caching=false`。
+
+每种 connector 模式都使用全新的 Mooncake master 启动一次 vLLM。冷跑从空远端缓存开始并
+建立缓存，热跑在不重启 vLLM 和 Mooncake 的前提下发送完全相同的 50 个请求。为避免
+Qwen3.5 hybrid 模型的动态批形状数值差异干扰 KV 正确性判断，严格准确率门禁使用
+`batch_size=1`：
+
+| mode | cold/hot F1 | exact prediction | put cold/hot | get cold/hot | Mooncake keys | bytes |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `use_layerwise=false` | 35.29 / 35.29 | 50 / 50 | 544 / 544 | 1 / 51 | 651 | 5714804736 |
+| `use_layerwise=true` | 35.29 / 35.29 | 50 / 50 | 3264 / 3264 | 7 / 357 | 3906 | 5714804736 |
+
+Mooncake master 在冷跑开始时为空；冷跑中的 1 次 non-layerwise get 和 7 次 layerwise get
+来自较早样本已经写入的 LongBench 公共模板前缀，不是测试前残留的远端缓存。
+
+两种模式的 50 个冷/热预测文本、逐样本 F1 和 completion token 数都完全一致；layerwise
+与 non-layerwise 的冷跑和热跑结果也分别 50/50 完全一致。热跑没有新增 put，并分别新增
+50 次 non-layerwise get 和 350 次 layerwise get。layerwise 的 key 数和调用数增加而总字节数
+不变，符合按物理层拆分同一份缓存数据的预期。两种模式均未出现 `Failed to put` 或
+`Failed to get`，所有 200 个 connector 请求均成功完成。
+
+并发准确率比较需要固定额外的数值稳定性基线。本次还执行了 `batch_size=4` 的 rolling 和
+wave 压力测试，但即使完全关闭 AscendStoreConnector 和 prefix cache，同一 vLLM 上连续
+两次 wave full-recompute 的 F1 也会从 34.08 变化到 33.52，只有 46/50 的生成文本一致。
+因此该环境下并发 greedy 输出的逐次 F1/文本差异不能单独归因于 Mooncake；并发测试用于
+覆盖调度、put/get 和长上下文压力，严格 KV 数值正确性则使用固定 batch 的串行冷/热比较，
+并由前述 DeepSeek-V4 完整首 token tensor 压力测试补充逐位一致性验证。
+
+测试产物保存在：
+
+```text
+/data/ascendstore-longbench-20260901/qasper50-serial/
+/data/ascendstore-longbench-20260901/qasper50/
+/data/ascendstore-longbench-20260901/qasper50-wave4/
+/data/ascendstore-longbench-20260901/qasper50-wave4-baseline/
+```
+
 ### 12.4 DeepSeek-V4 SWA 传输缩减
 
 使用 DeepSeek-V4 测试 config 的实际参数：
