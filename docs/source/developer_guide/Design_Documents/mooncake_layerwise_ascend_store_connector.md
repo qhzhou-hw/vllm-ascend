@@ -233,22 +233,26 @@ DeepSeek-V4@pcp0@dcp0@head_or_tp_rank:0@group:1@cache_role:kv@cache_family:c4@la
 
 ### 6.2 查询算法
 
-`_get_hybrid_layerwise_store_hit_tokens()` 对每个 group 独立执行：
+`_get_hybrid_layerwise_store_hit_tokens()` 使用与 worker 相同的
+`AscendStoreCoordinator` 执行：
 
 1. 按 `hash_block_size` 截取请求的基础 block hash；
-2. 使用该 group 的 block size 调用 `get_block_hashes()`，得到 group block hash；
-3. 为每个 block 生成该 group 所有 layer key；
-4. 调用 Mooncake `batch_is_exist()`；
-5. 只有一个 block 的全部 layer key 都存在时，该 block 才算命中；
-6. 遇到第一个缺失 block 后停止累计该 group 的连续命中；
-7. 取所有 group 命中 token 数的最小值；
-8. 向下对齐到 `cache_transfer_granularity`。
+2. 调用 `lookup_mask()`，由各 group 的 vLLM cache manager 标记当前前缀实际可恢复的 block；
+3. 使用该 group 的 block size 调用 `get_block_hashes()`，仅为 mask 允许的 block 生成所有
+   layer key；
+4. 调用 Mooncake `batch_is_exist()`，只有一个 block 的全部 layer key 都存在时才把它加入
+   `ExternalCachedBlockPool`；
+5. 调用 `find_longest_cache_hit()`，由 vLLM hybrid coordinator 计算所有 group 的公共可恢复
+   前缀；
+6. 向下对齐到 `cache_transfer_granularity`。
 
 公式为：
 
 ```text
+reachable = coordinator.lookup_mask(candidate_tokens)
+external_pool = query_all_reachable_layer_keys(reachable)
 common_hit_tokens = floor_to_transfer_granularity(
-    min(hit_tokens[group] for group in attention_kv_groups)
+    coordinator.find_longest_cache_hit(external_pool)
 )
 ```
 
@@ -317,6 +321,11 @@ Mooncake key-based layerwise 路径执行以下处理：
 3. 把允许传输的 block 合并为连续 `LayerBlockRange`；
 4. 每个 group 只为这些 range 创建逐层 GET/PUT task；
 5. key-based sending/receiving thread 在最终地址解析后再次跳过 block 0。
+
+Scheduler 侧也必须应用同一个 `lookup_mask()`。如果只在 worker 侧裁掉不可达 SWA block，
+而 scheduler 仍要求所有逻辑 block 的逐层 key 存在，热请求会因为这些“有意不保存”的 key
+缺失而把公共命中错误压成 0，最终不会触发 Mooncake get。Scheduler 和 worker 共用
+coordinator 后，保存范围、存在性查询和最长前缀计算使用同一份 vLLM reachability 语义。
 
 例如 mask 为：
 
@@ -747,6 +756,25 @@ Ascend 单卡实测结果：
 `3 * 129280` 个 FP32 log-probability 值逐位一致。layerwise case 的 12 次 put/get 等于
 3 个样本乘以 4 个物理层；backend DEBUG 日志中的 key 也包含 `layer_id:0` 到
 `layer_id:3`。执行命令示例：
+
+在 8 层 DeepSeek-V4 hybrid config 上又执行了 36 请求压力测试，保留实际
+`compress_ratios=[0,0,4,128,4,128,4,128]` 和 4096-token 传输粒度。请求覆盖
+4095/4096/4097 与 8191/8192/8193 两组边界，batch size 为 4，并分别运行 full
+recompute、non-layerwise Mooncake load 和 layerwise Mooncake load：
+
+| case | Mooncake put | Mooncake get | max abs diff | bitwise equal |
+| --- | ---: | ---: | ---: | --- |
+| `use_layerwise=false` | 126 | 16 | 0.0 | true |
+| `use_layerwise=true` | 144 | 112 | 0.0 | true |
+
+两种 Mooncake case 的 put/get failure 均为 0，36 个样本的完整 129280 维首 token tensor
+都与 full recompute 逐位一致。该压力测试同时暴露并验证了 scheduler reachability 修复：
+修复前 layerwise scheduler 因查询已裁掉的 SWA key 而得到 0 公共命中，修复后 14 个热请求
+命中 4096 token、2 个热请求命中 8192 token，并实际执行逐层 get。
+
+上述非零命中数小于请求总数并不表示请求未校验：4095/4096-token 边界请求在扣除当前
+未完成 token 后不能形成完整 4096-token load 单元，因此按预期 full recompute；数值比较
+仍覆盖全部 36 个请求。
 
 ```bash
 python tests/e2e/pull_request/one_card/\

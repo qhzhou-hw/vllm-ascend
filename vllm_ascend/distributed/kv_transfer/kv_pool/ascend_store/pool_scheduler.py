@@ -26,6 +26,10 @@ from vllm.v1.serial_utils import MsgpackEncoder
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend import (
     backend_map,
 )
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.coordinator import (
+    AscendStoreCoordinator,
+    ExternalCachedBlockPool,
+)
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_cache_layout import (
     build_layerwise_cache_layout,
     build_layerwise_reuse_layout,
@@ -41,6 +45,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     PoolKey,
     ReqMeta,
     RequestTracker,
+    block_hash_to_bytes,
     block_hash_to_str,
     get_block_hashes,
     get_group_block_size,
@@ -129,6 +134,7 @@ class KVPoolScheduler:
         self.cache_transfer_granularity = infer_cache_transfer_granularity(
             self.grouped_block_size, self.lcm_block_size, self.kv_cache_group_ids
         )
+        self.cache_coordinator = self._build_cache_coordinator()
         # request_id -> full_token_ids
         self._request_trackers: dict[str, RequestTracker] = {}
         self._preempted_req_ids: set[str] = set()
@@ -192,8 +198,7 @@ class KVPoolScheduler:
         if kv_cache_config is not None and self.use_hybrid:
             for group_id, group in enumerate(kv_cache_config.kv_cache_groups):
                 physical_layers = {
-                    get_layerwise_physical_layer_index(layer_name, self.num_layers)
-                    for layer_name in group.layer_names
+                    get_layerwise_physical_layer_index(layer_name, self.num_layers) for layer_name in group.layer_names
                 }
                 self.group_num_layers[group_id] = len(physical_layers)
         logger.info(
@@ -229,6 +234,19 @@ class KVPoolScheduler:
         self.model_name = model_config.model.split("/")[-1]
 
         self.client: LookupKeyClient | None = None
+
+    def _build_cache_coordinator(self) -> AscendStoreCoordinator | None:
+        if self.kv_cache_config is None or not self.use_hybrid:
+            return None
+        return AscendStoreCoordinator(
+            self.kv_cache_config.kv_cache_groups,
+            scheduler_block_size=self.cache_transfer_granularity,
+            hash_block_size=self.hash_block_size,
+            group_block_sizes=self.grouped_block_size,
+            group_cache_families=self.kv_cache_group_families,
+            use_eagle=self.use_eagle,
+            retention_interval=self.retention_interval,
+        )
 
     def _get_or_create_request_tracker(self, req_id: str) -> RequestTracker:
         tracker = self._request_trackers.get(req_id)
@@ -337,6 +355,9 @@ class KVPoolScheduler:
         num_computed_tokens: int,
     ) -> int:
         """Return the common Mooncake layerwise hit across all KV groups."""
+        if self.cache_coordinator is not None:
+            return self._get_coordinated_hybrid_layerwise_hit_tokens(request, token_len)
+
         hits_per_group: list[int] = []
         num_hash_blocks = token_len // self.hash_block_size
         block_hashes = request.block_hashes[:num_hash_blocks]
@@ -345,9 +366,7 @@ class KVPoolScheduler:
             group_block_size = get_group_block_size(self.grouped_block_size, group_id)
             group_block_hashes = get_block_hashes(block_hashes, group_block_size, self.hash_block_size)
             query_start_block = (
-                0
-                if self.use_layerwise
-                else min(num_computed_tokens // group_block_size, len(group_block_hashes))
+                0 if self.use_layerwise else min(num_computed_tokens // group_block_size, len(group_block_hashes))
             )
             hashes_to_query = group_block_hashes[query_start_block:]
             keys_by_block = self._generate_store_query_keys(
@@ -424,6 +443,84 @@ class KVPoolScheduler:
             hit_tokens,
         )
         return self._floor_to_cache_transfer_granularity(hit_tokens)
+
+    def _get_coordinated_hybrid_layerwise_hit_tokens(
+        self,
+        request: "Request",
+        token_len: int,
+    ) -> int:
+        """Resolve layerwise hits with the same reachability rules as workers."""
+        assert self.cache_coordinator is not None
+        lookup_token_len = self._floor_to_cache_transfer_granularity(token_len)
+        if lookup_token_len <= 0:
+            return 0
+
+        num_hash_blocks = lookup_token_len // self.hash_block_size
+        block_hashes = request.block_hashes[:num_hash_blocks]
+        lookup_masks = self.cache_coordinator.lookup_mask(lookup_token_len)
+        exists: set[tuple[int, bytes]] = set()
+
+        for group_id in self.kv_cache_group_ids:
+            group_block_size = get_group_block_size(self.grouped_block_size, group_id)
+            group_block_hashes = get_block_hashes(block_hashes, group_block_size, self.hash_block_size)
+            group_mask = lookup_masks[group_id] if group_id < len(lookup_masks) else None
+            queried_hashes = [
+                block_hash
+                for block_index, block_hash in enumerate(group_block_hashes)
+                if group_mask is None or (block_index < len(group_mask) and group_mask[block_index])
+            ]
+            keys_by_block = self._generate_store_query_keys(
+                queried_hashes,
+                include_layers=True,
+                kv_cache_group_id=group_id,
+            )
+            query_keys = [key for block_keys in keys_by_block for key in block_keys]
+            if not query_keys:
+                continue
+
+            exists_states = self.store_scheduler.batch_is_exist(query_keys)
+            if len(exists_states) != len(query_keys):
+                raise RuntimeError(
+                    "KV pool exists check returned unexpected number of states "
+                    f"for request {request.request_id}, group {group_id}: "
+                    f"expected={len(query_keys)}, actual={len(exists_states)}"
+                )
+
+            offset = 0
+            for block_hash, block_keys in zip(queried_hashes, keys_by_block, strict=True):
+                block_states = exists_states[offset : offset + len(block_keys)]
+                offset += len(block_keys)
+                if any(state not in (0, 1) for state in block_states):
+                    raise RuntimeError(
+                        f"KV pool exists check failed for request {request.request_id}, "
+                        f"group {group_id}: states={block_states}"
+                    )
+                if all(state == 1 for state in block_states):
+                    exists.add((group_id, block_hash_to_bytes(block_hash)))
+
+            logger.debug(
+                "KV pool coordinated hybrid layerwise lookup req=%s group=%d "
+                "reachable_blocks=%d hit_blocks=%d sample_keys=%s",
+                request.request_id,
+                group_id,
+                len(queried_hashes),
+                sum(1 for candidate_group, _ in exists if candidate_group == group_id),
+                query_keys[: min(2, len(query_keys))],
+            )
+
+        _, hit_length = self.cache_coordinator.find_longest_cache_hit(
+            block_hashes,
+            lookup_token_len,
+            ExternalCachedBlockPool(self.hash_block_size, exists),
+            apply_eagle=False,
+        )
+        logger.debug(
+            "KV pool coordinated hybrid layerwise lookup final req=%s token_len=%d hit_tokens=%d",
+            request.request_id,
+            lookup_token_len,
+            hit_length,
+        )
+        return self._floor_to_cache_transfer_granularity(hit_length)
 
     def _make_layerwise_gva_keys_for_hit_check(self, group_id: int, block_hash_hex: str) -> list[str]:
         """Generate all-rank GVA keys for scheduler-side hit check.

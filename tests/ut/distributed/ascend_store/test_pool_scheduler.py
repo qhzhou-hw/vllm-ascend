@@ -646,6 +646,44 @@ class TestKVPoolSchedulerGetStoreLookupHitTokens(unittest.TestCase):
 
         self.assertEqual(result, 64)
 
+    def test_hybrid_layerwise_coordinator_skips_unreachable_blocks(self):
+        scheduler = self._make_scheduler()
+        scheduler.use_layerwise = True
+        scheduler.use_hybrid = True
+        scheduler.kv_cache_group_ids = [0, 1]
+        scheduler.grouped_block_size = [16, 32]
+        scheduler.hash_block_size = 16
+        scheduler.cache_transfer_granularity = 32
+        scheduler.group_num_layers = [2, 1]
+        scheduler.cache_coordinator = MagicMock()
+        scheduler.cache_coordinator.lookup_mask.return_value = (
+            [False, False, True, True],
+            [False, True],
+        )
+        scheduler.cache_coordinator.find_longest_cache_hit.return_value = ((), 64)
+        scheduler.store_scheduler.batch_is_exist.side_effect = [
+            [1, 1, 1, 1],
+            [1],
+        ]
+        request = MagicMock(request_id="r1", block_hashes=[b"h0", b"h1", b"h2", b"h3"])
+
+        result = scheduler._get_store_lookup_hit_tokens(
+            request,
+            token_len=64,
+            num_computed_tokens=0,
+            include_layers=True,
+        )
+
+        self.assertEqual(result, 64)
+        scheduler.cache_coordinator.lookup_mask.assert_called_once_with(64)
+        group0_keys = scheduler.store_scheduler.batch_is_exist.call_args_list[0].args[0]
+        group1_keys = scheduler.store_scheduler.batch_is_exist.call_args_list[1].args[0]
+        self.assertEqual(len(group0_keys), 4)
+        self.assertEqual(len(group1_keys), 1)
+        scheduler.cache_coordinator.find_longest_cache_hit.assert_called_once()
+        cached_pool = scheduler.cache_coordinator.find_longest_cache_hit.call_args.args[2]
+        self.assertEqual(len(cached_pool._exists), 3)
+
 
 class TestKVPoolSchedulerFloorGranularity(unittest.TestCase):
     """Test _floor_to_cache_transfer_granularity."""
