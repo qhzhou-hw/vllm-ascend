@@ -899,6 +899,9 @@ reachable indices: [31]
 
 ### 12.5 DSV4 partial compressed-page 读写放大修复
 
+完整的问题复盘、32K 数据量闭环和未处理 state 冗余见
+[DeepSeek-V4 AscendStore 传输放大分析与优化](dsv4_ascend_store_transfer_amplification.md)。
+
 旧实现使用 KV tensor 第一维与 `kv_cache_config.num_blocks` 的比值推导一个 store block
 的 value 大小：
 
