@@ -98,6 +98,43 @@ class TestKVPoolWorkerHelpers(unittest.TestCase):
 
         return KVPoolWorker
 
+    def test_transfer_block_len_trims_partial_compressed_page(self):
+        cls = self._make_worker_class()
+        cache = MagicMock()
+        cache.__getitem__.return_value.numel.return_value = 128 * 1024
+        cache.element_size.return_value = 1
+
+        block_len = cls._get_transfer_block_len(
+            cache,
+            physical_block_len=1024 * 1024,
+            group_block_size=2048,
+            layer_spec=SimpleNamespace(block_size=16384, compress_ratio=128),
+        )
+
+        self.assertEqual(block_len, 16 * 1024)
+
+    def test_transfer_block_len_preserves_full_pages_and_state_caches(self):
+        cls = self._make_worker_class()
+        cache = MagicMock()
+        cache.__getitem__.return_value.numel.return_value = 128 * 1024
+        cache.element_size.return_value = 1
+
+        c4_len = cls._get_transfer_block_len(
+            cache,
+            physical_block_len=512 * 1024,
+            group_block_size=2048,
+            layer_spec=SimpleNamespace(block_size=512, compress_ratio=4),
+        )
+        state_len = cls._get_transfer_block_len(
+            cache,
+            physical_block_len=2 * 1024 * 1024,
+            group_block_size=2048,
+            layer_spec=SimpleNamespace(block_size=4, compress_ratio=1),
+        )
+
+        self.assertEqual(c4_len, 512 * 1024)
+        self.assertEqual(state_len, 2 * 1024 * 1024)
+
     def test_check_all_layers_exists(self):
         cls = self._make_worker_class()
         cases = [

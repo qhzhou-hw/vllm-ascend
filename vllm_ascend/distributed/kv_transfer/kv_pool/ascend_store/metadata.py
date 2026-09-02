@@ -15,6 +15,8 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec, UniformTypeKVCacheSpec
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import AttentionComputeStartGate
 
+ASCEND_STORE_VALUE_LAYOUT_VERSION = 2
+
 
 @dataclass(frozen=True)
 class TPMismatchInfo:
@@ -90,6 +92,8 @@ class KeyMetadata:
     cache_role: str = "kv"
     """ Family name for compress-aware hybrid cache layouts """
     cache_family: str = "default"
+    """ Version of the serialized value layout """
+    value_layout_version: int = ASCEND_STORE_VALUE_LAYOUT_VERSION
 
 
 @dataclass(order=True)
@@ -108,6 +112,7 @@ class PoolKey:
                 self.key_metadata.kv_cache_group_id,
                 self.key_metadata.cache_role,
                 self.key_metadata.cache_family,
+                self.key_metadata.value_layout_version,
                 self.chunk_hash,
             )
         )
@@ -121,6 +126,7 @@ class PoolKey:
             f"@group:{self.key_metadata.kv_cache_group_id}"
             f"@cache_role:{self.key_metadata.cache_role}"
             f"@cache_family:{self.key_metadata.cache_family}"
+            f"@value_layout:{self.key_metadata.value_layout_version}"
             f"@{self.chunk_hash}"
         )
 
@@ -154,6 +160,7 @@ class LayerPoolKey(PoolKey):
                 self.key_metadata.kv_cache_group_id,
                 self.key_metadata.cache_role,
                 self.key_metadata.cache_family,
+                self.key_metadata.value_layout_version,
                 self.chunk_hash,
                 self.layer_id,
             )
@@ -167,6 +174,7 @@ class LayerPoolKey(PoolKey):
             f"@group:{self.key_metadata.kv_cache_group_id}"
             f"@cache_role:{self.key_metadata.cache_role}"
             f"@cache_family:{self.key_metadata.cache_family}"
+            f"@value_layout:{self.key_metadata.value_layout_version}"
             f"@layer_id:{self.layer_id}"
             f"@{self.chunk_hash}"
         )
@@ -346,7 +354,8 @@ class ChunkedTokenDatabase:
                 f"@pp_rank:{group_metadata.pp_rank}"
                 f"@group:{kv_cache_group_id}"
                 f"@cache_role:{cache_role}"
-                f"@cache_family:{cache_family}@"
+                f"@cache_family:{cache_family}"
+                f"@value_layout:{group_metadata.value_layout_version}@"
             )
             self._key_prefix_cache[cache_key] = prefix
         return prefix
@@ -403,6 +412,7 @@ class ChunkedTokenDatabase:
                 kv_cache_group_id=kv_cache_group_id,
                 cache_role=cache_role,
                 cache_family=cache_family,
+                value_layout_version=group_metadata.value_layout_version,
             ),
             chunk_hash,
         )

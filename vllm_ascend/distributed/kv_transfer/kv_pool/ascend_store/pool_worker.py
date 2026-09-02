@@ -645,6 +645,59 @@ class KVPoolWorker:
         return block_len, block_stride, region_len, block_size_scale
 
     @staticmethod
+    def _get_transfer_block_len(
+        cache: torch.Tensor,
+        physical_block_len: int,
+        group_block_size: int,
+        layer_spec: Any | None,
+    ) -> int:
+        """Return the bytes that contain useful data in one store block.
+
+        A compressed DSV4 page can cover more logical tokens than the cache
+        group's store block.  The physical allocation still reserves one or
+        more complete pages for every block id, but the kernel writes only the
+        prefix corresponding to that store block.  Transferring the complete
+        allocation in that case causes severe read/write amplification (for
+        example, a c128 page covers 16384 tokens while a 2048-token store block
+        contains only one eighth of that page).
+
+        Keep the physical stride unchanged and shorten only the contiguous
+        useful prefix.  Other cache types, including sliding-window and state
+        caches, retain their existing transfer geometry because their page
+        contents are not a dense per-token mapping.
+        """
+        if layer_spec is None:
+            return physical_block_len
+
+        compress_ratio = getattr(layer_spec, "compress_ratio", 1)
+        logical_page_tokens = getattr(layer_spec, "block_size", None)
+        if (
+            not isinstance(compress_ratio, int)
+            or compress_ratio <= 1
+            or not isinstance(logical_page_tokens, int)
+            or logical_page_tokens <= group_block_size
+            or group_block_size % compress_ratio != 0
+        ):
+            return physical_block_len
+
+        page_content_len = cache[0].numel() * cache.element_size()
+        scaled_content_len = page_content_len * group_block_size
+        if scaled_content_len % logical_page_tokens != 0:
+            logger.warning_once(
+                "Cannot trim compressed KV transfer block: page bytes %d times "
+                "group block size %d is not divisible by logical page tokens %d.",
+                page_content_len,
+                group_block_size,
+                logical_page_tokens,
+            )
+            return physical_block_len
+
+        transfer_block_len = scaled_content_len // logical_page_tokens
+        if transfer_block_len <= 0 or transfer_block_len > physical_block_len:
+            return physical_block_len
+        return transfer_block_len
+
+    @staticmethod
     def _get_storage_key(cache: torch.Tensor) -> int:
         try:
             return cache.untyped_storage().data_ptr()
@@ -663,6 +716,10 @@ class KVPoolWorker:
         group_addrs: list[int] = []
         group_block_lens: list[int] = []
         group_block_strides: list[int] = []
+        group_block_size = get_group_block_size(self.grouped_block_size, group_id)
+        layer_specs = (
+            get_layerwise_kv_cache_specs(self.kv_cache_config) if self.kv_cache_config is not None else {}
+        )
         layer_names_by_physical: dict[int, list[str]] = {}
         for layer_name in layer_names:
             phys = self._extract_physical_layer_index(layer_name)
@@ -676,7 +733,21 @@ class KVPoolWorker:
                 cache_or_caches = self.kv_caches[layer_name]
                 for cache in self._as_cache_tuple(cache_or_caches):
                     base_addr = cache.data_ptr()
-                    block_len, block_stride, _, _ = self._get_cache_block_metadata(cache)
+                    physical_block_len, block_stride, _, _ = self._get_cache_block_metadata(cache)
+                    block_len = self._get_transfer_block_len(
+                        cache,
+                        physical_block_len,
+                        group_block_size,
+                        layer_specs.get(layer_name),
+                    )
+                    if block_len != physical_block_len:
+                        logger.info(
+                            "Trim compressed KV transfer entry %s in group %d from %d to %d bytes per block.",
+                            layer_name,
+                            group_id,
+                            physical_block_len,
+                            block_len,
+                        )
                     group_addrs.append(base_addr)
                     group_block_lens.append(block_len)
                     group_block_strides.append(block_stride)

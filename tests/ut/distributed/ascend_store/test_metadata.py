@@ -148,6 +148,7 @@ class TestPoolKey(unittest.TestCase):
         self.assertIn("@dcp3", s)
         self.assertIn("@head_or_tp_rank:1", s)
         self.assertIn("@pp_rank:0", s)
+        self.assertIn("@value_layout:2", s)
         self.assertIn("hash1", s)
 
     def test_pp_ranks_use_distinct_keys(self):
@@ -181,6 +182,7 @@ class TestLayerPoolKey(unittest.TestCase):
         k = LayerPoolKey(meta, "h1", 5)
         s = k.to_string()
         self.assertIn("@layer_id:5", s)
+        self.assertIn("@value_layout:2", s)
         self.assertIn("model", s)
         self.assertTrue(s.endswith("@h1"))
 
@@ -297,7 +299,10 @@ class TestChunkedTokenDatabase(unittest.TestCase):
             (pool_key_result[0][0], pool_key_result[0][1], pool_key_result[0][2].to_string()),
         )
         layer_key = pool_key_result[0][2].split_layers(2)[1]
-        self.assertIn("@group:1@cache_role:kv@cache_family:c2@layer_id:1", layer_key.to_string())
+        self.assertIn(
+            "@group:1@cache_role:kv@cache_family:c2@value_layout:2@layer_id:1",
+            layer_key.to_string(),
+        )
 
     def test_key_strings_pre_shard_after_filtering(self):
         hashes = ["a", "b", "c", "d"]
@@ -398,6 +403,28 @@ class TestChunkedTokenDatabase(unittest.TestCase):
         # layer_id=0, entries_per_layers=2 => group_addrs[0] and group_addrs[1]
         self.assertEqual(addr[0], 1000 + 5 * 160)
         self.assertEqual(addr[1], 2000 + 5 * 320)
+
+    def test_partial_compressed_page_uses_trimmed_size_in_both_modes(self):
+        db = ChunkedTokenDatabase([self.meta], block_size=[2048], partitions=None)
+        db.set_group_buffers(
+            {0: [1000]},
+            {0: [16 * 1024]},
+            {0: [1024 * 1024]},
+            group_num_layers={0: 1},
+            group_layer_cache_entry_offsets={0: [0, 1]},
+        )
+
+        addr, size, block_id = db.prepare_value(0, 2048, [3])
+        layer_addr, layer_size, layer_block_id = db.prepare_value_layer(
+            0,
+            2048,
+            [3],
+            layer_id=0,
+        )
+
+        expected = ([1000 + 3 * 1024 * 1024], [16 * 1024], 3)
+        self.assertEqual((addr, size, block_id), expected)
+        self.assertEqual((layer_addr, layer_size, layer_block_id), expected)
 
     def test_decode_adaptor_prefill_pp_no_partitions(self):
         key, addr, size = self.db.decode_adaptor_prefill_pp(["k1"], [[1, 2]], [[10, 20]])

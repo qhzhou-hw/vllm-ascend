@@ -897,6 +897,61 @@ reachable indices: [31]
 72a924474 fix(kv_pool): honor SWA reachability in AscendStore
 ```
 
+### 12.5 DSV4 partial compressed-page 读写放大修复
+
+旧实现使用 KV tensor 第一维与 `kv_cache_config.num_blocks` 的比值推导一个 store block
+的 value 大小：
+
+```text
+physical_block_len = page_content_bytes * (tensor_num_blocks / num_blocks)
+```
+
+这个值适合描述物理分配和相邻 block 的 stride，但不一定等于有效数据大小。DSV4 c128
+的一个 128 KiB page 覆盖 16384 个原始 token；当 group/store block 只覆盖 2048 token
+时，kernel 只会写 page 开头的 16 KiB。旧路径却把聚合后的 1 MiB 物理区域完整传给
+Mooncake，造成单个 entry 64 倍放大。
+
+修复后，每个 cache entry 同时保留两种几何信息：
+
+- `block_stride` 继续使用完整物理分配跨度，用于从 block id 定位正确地址；
+- `block_len` 使用该 entry 的准确 spec 计算连续有效前缀，只决定 Mooncake GET/PUT 的
+  value 大小。
+
+对于压缩 page 大于当前 group block 的 dense MLA entry：
+
+```text
+transfer_block_len =
+    page_content_bytes * group_block_tokens / entry_logical_page_tokens
+```
+
+只有结果是整数字节、group boundary 对齐 compression ratio 且不超过物理 block 时才启用
+裁剪，否则保守回退到原始长度。SWA 和 compressor state 不是简单的 dense per-token
+page，当前修复不会用上述公式猜测它们的有效区间；它们继续使用 manager reachability 和
+既有物理几何，避免把 ring/window 中间的数据截断。
+
+以 2048-token store block 的 c128 entry 为例：
+
+```text
+old value size = 1 MiB
+new value size = 128 KiB * 2048 / 16384 = 16 KiB
+```
+
+layerwise 与 non-layerwise 都消费同一个 `group_block_len`，因此两条路径同时生效；key
+数量和物理 block id 不变。按 32K 实测报告中 `20 layers * 17 saves` 估算，c128 MLA
+部分从 340 MiB 降到约 5.3 MiB。这个数字只表示本次可证明安全的 c128 dense-page 修复，
+不把 SWA/state 的物理保留空间误记为已消除。
+
+value 的序列化长度发生变化后，旧对象不能与新实例混用。key 中新增
+`value_layout:2` 命名空间；scheduler、non-layerwise、layerwise 和直接 key 快速路径均使用
+同一版本号。滚动升级时旧对象自然 miss，无需手工清空 Mooncake。
+
+回归测试覆盖：
+
+- 1 MiB c128 物理 block 在 2048/16384 比例下只传 16 KiB；
+- c4 完整 page 和 state cache 保持原有长度；
+- non-layerwise `prepare_value` 与 layerwise `prepare_value_layer` 使用相同的 16 KiB value；
+- PoolKey、LayerPoolKey 和直接 key 快速路径均携带 `value_layout:2`。
+
 ## 13. 错误处理与可观测性
 
 Mooncake backend 在 debug 日志中输出实际调用：
