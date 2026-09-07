@@ -90,6 +90,27 @@ llm = LLM(
 - 让 `max_num_scheduled_tokens` 等于 `max_num_batched_tokens`，避免 hybrid 模型默认的 2048-token 调度上限拆开 HYPIC prompt；
 - 保持 vLLM prefix caching 开启，以满足 hybrid cache 的 page-size 校验，但 HYPIC 会绕过标准 prefix hit 并独立维护 segment cache。
 
+`seam_sink_tokens` 的合法范围是 `0 <= seam_sink_tokens < chunk_size`。设置为 `0`
+表示完全复用命中的非末段 segment，不为该 segment 生成 query token：Attention 直接恢复
+缓存 KV，GDN 直接组合缓存的 transition 和 zero state。cache miss 不受该选项影响，仍然
+完整计算；最后一个 segment 也始终完整计算以产生 logits。
+
+```python
+additional_config={
+    "hypic_config": {
+        "enabled": True,
+        "chunk_size": 512,
+        "seam_sink_tokens": 0,
+        "max_cache_segments": 96,
+    }
+}
+```
+
+当前 LongBench-E 和 MCPAgentBench 的已记录准确率使用 `seam_sink_tokens=8`，尚不能据此
+推断零 seam 的准确率。零 seam 虽然受配置校验和执行路径支持，但更容易放大 segment
+边界处的近似误差；用于新任务前应分别与 Full Recompute 和 seam=8 做固定样本及完整
+指标对比。
+
 Full Recompute 基线应显式设置 `enable_prefix_caching=False`，不要与 HYPIC engine 复用。
 
 ### 3.3 在 scheduler 侧建立可序列化 plan
@@ -345,6 +366,16 @@ block-table row、GDN decode state slot 和 segment plan。一次 forward 的 pl
 ### 6.10 `cached_tokens` 当前不是可靠统计项
 
 现有 offline LongBench runner 的 `cached_tokens` 字段填 0，并未从 HYPIC plan 汇总真实命中 token。准确率可以使用该 runner；若要报告命中率或性能收益，应另加 scheduler plan 统计，不能直接使用该字段。
+
+### 6.11 零 seam 是支持的激进配置，不是已验证默认值
+
+`seam_sink_tokens=0` 不等于关闭 HYPIC，也不会强制跳过未缓存的 segment。它只让已经
+命中的非末段 segment 完全不重算。此时 planner 不为命中段加入 `query_positions`，
+Attention 从 HYPIC cache 恢复完整 KV 并回填 paged KV，GDN 则直接组合缓存状态。
+
+实现依靠末段恒为 miss 的规则保证仍有 token 参与 forward 并产生 logits。修改这一规则
+或允许末段命中时，不能假设零 seam 路径仍然安全。准确率评测至少应覆盖 warm hit、跨段
+问答、生成式摘要和多工具选择；在这些验证完成前，推荐继续使用默认值 8。
 
 ## 7. Review 和回归检查表
 

@@ -52,6 +52,28 @@ outputs = llm.generate(
 is always recomputed. `seam_sink_tokens` controls how many tokens at a reused
 segment boundary are recomputed to reduce boundary error.
 
+`seam_sink_tokens` may be set to `0` for complete segment reuse:
+
+```python
+additional_config={
+    "hypic_config": {
+        "enabled": True,
+        "chunk_size": 512,
+        "seam_sink_tokens": 0,
+        "max_cache_segments": 96,
+    }
+}
+```
+
+With zero seam, a non-final cache-hit segment contributes no query tokens.
+HYPIC restores its attention KV data and composes its cached GDN transition
+state directly. The final segment is still fully recomputed to produce logits,
+and a cache miss is always computed regardless of this setting. Zero seam is
+supported by the execution path, but the published LongBench-E and
+MCPAgentBench accuracy results used the default value of `8`. Use `0` only
+after checking accuracy for the target workload; it may amplify approximation
+error around segment boundaries.
+
 `max_cache_segments` sizes fixed model-owned attention and GDN state pools.
 vLLM accounts for these buffers before sizing its ordinary KV cache. It must be
 at least `ceil(max_num_batched_tokens / chunk_size) - 1`, so every cacheable
@@ -87,3 +109,6 @@ python examples/offline_inference/hypic_longbench.py \
   the time they reach the model runner; normal vLLM text inputs satisfy this
   requirement through tokenizer preprocessing.
 - The cache is process-local and is cleared when the engine exits.
+- `seam_sink_tokens=0` is allowed, but is a more aggressive reuse mode than the
+  validated default of `8` and has not yet passed the documented accuracy
+  suites.
