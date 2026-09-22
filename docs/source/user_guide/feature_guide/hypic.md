@@ -6,6 +6,10 @@ and recurrent Gated DeltaNet state, while recomputing a small seam around the
 segment boundary. The feature is opt-in and currently targets Qwen3.5 hybrid
 attention models on Ascend 910B.
 
+The PIC scheduler adapter described below is newly implemented and awaits
+Ascend integration/accuracy validation. Published results for the previous
+HYPIC implementation do not validate this adapter.
+
 For implementation details and reproducible accuracy evaluation, see the
 [Chinese porting guide](../../developer_guide/hypic_ascend_porting_zh.md) and
 [LongBench-E guide](../../developer_guide/evaluation/hypic_longbench_zh.md).
@@ -75,9 +79,64 @@ after checking accuracy for the target workload; it may amplify approximation
 error around segment boundaries.
 
 `max_cache_segments` sizes fixed model-owned attention and GDN state pools.
-vLLM accounts for these buffers before sizing its ordinary KV cache. It must be
-at least `ceil(max_num_batched_tokens / chunk_size) - 1`, so every cacheable
-segment in one packed prefill keeps a stable slot across all model layers.
+vLLM accounts for these buffers before sizing its ordinary KV cache. Admitted
+hits keep their slots for the whole forward. If the pool cannot store all new
+segments, the remaining misses compute normally without a persistent cache
+write; the old minimum-slot formula no longer applies.
+
+`max_prefill_units` (default `256`) independently bounds GDN S/T workspace
+units per batch. Many short semantic segments can consume substantial FP32
+workspace despite a small token count. Requests exceeding this limit on their
+own are rejected with an explicit error; increase it only after sizing the
+workspace on the target model/device.
+
+## PIC matching and request policies
+
+PIC keys use segment token content, request `cache_salt`, and the effective
+full/interior GDN representation. Entries belong to one engine/model lifetime.
+Moving an interior tool segment to another interior position can hit even when
+its prefix changes. Moving between the first and an interior segment with a
+nonzero seam may miss, because their cached transitions cover different ranges.
+Short segments entirely consumed by the seam are computed without caching.
+
+RoPE relocation does not remove dependence on the original context. PIC is
+approximate reuse and must be evaluated against full recomputation.
+
+```python
+params = SamplingParams(
+    temperature=0,
+    max_tokens=128,
+    extra_args={
+        "hypic_cache_policy": "pic",
+        # Token offsets in the actual rendered/tokenized input; optional.
+        "hypic_segment_boundaries": [0, 128, 512, 900],
+    },
+)
+```
+
+The boundary offsets above are illustrative and must match the actual input.
+Each semantic region is split further when longer than `chunk_size`.
+
+| Policy | Behavior with HYPIC enabled |
+| --- | --- |
+| `pic` (default) | Segment reuse; ordinary APC lookup and publication disabled |
+| `prefix_only` | Native inference and ordinary exact prefix caching |
+| `full_recompute` | Native inference with neither PIC nor APC reuse/publication |
+
+The scheduler separates PIC and native prefill batches. PIC results never
+enter the ordinary APC namespace, including subsequent decode blocks. Native
+decode consumes the materialized request KV and composed request GDN state.
+Combining APC and PIC within one request is not enabled in this adapter.
+
+The first adapter conservatively budgets the full logical prompt length during
+admission. Only the worker executes the smaller query set; logical progress and
+block allocation retain their native meaning. Restore volume is bounded by this
+same logical-token budget. Consequently a warm cache does not increase the
+number of logical prompt tokens admitted per batch yet.
+
+An in-flight cache failure stops the engine rather than publishing uncertain
+slots or retrying against a partially overwritten cache. Restarting creates a
+new cache epoch and requires warming the cache again.
 
 The repository includes two runnable examples:
 
@@ -108,7 +167,12 @@ python examples/offline_inference/hypic_longbench.py \
 - Prompt logprobs are not supported. Requests must contain prompt token IDs by
   the time they reach the model runner; normal vLLM text inputs satisfy this
   requirement through tokenizer preprocessing.
+- The PIC adapter rejects LoRA and quantized-model configurations, as well as
+  routed-expert output. These require additional payload and metadata support.
 - The cache is process-local and is cleared when the engine exits.
 - `seam_sink_tokens=0` is allowed, but is a more aggressive reuse mode than the
   validated default of `8` and has not yet passed the documented accuracy
   suites.
+
+Server validation commands and implementation boundaries are recorded in the
+[PIC implementation and validation notes](../../developer_guide/hypic_pic_implementation_zh.md).

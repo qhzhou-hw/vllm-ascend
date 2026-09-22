@@ -12,6 +12,7 @@ from vllm_ascend.hypic.attention import (
 from vllm_ascend.hypic.cache import DeviceSegmentCache, SegmentCatalog
 from vllm_ascend.hypic.config import HypicConfig, get_hypic_config
 from vllm_ascend.hypic.gdn import forward_hypic_gdn
+from vllm_ascend.hypic.pic_cache import PicCatalog, PicDeviceCache
 from vllm_ascend.hypic.planner import (
     build_plan,
     segment_hash,
@@ -73,7 +74,9 @@ def test_semantic_boundaries_reject_invalid_offsets(boundaries) -> None:
 
 
 def test_reordered_semantic_segments_hit_independently() -> None:
-    config = HypicConfig(enabled=True, chunk_size=8, seam_sink_tokens=1)
+    # Full/interior GDN representations differ with a nonzero seam. With
+    # seam=0 a segment can safely match either role under PIC semantics.
+    config = HypicConfig(enabled=True, chunk_size=8, seam_sink_tokens=0)
     first_tokens = [10, 11, 20, 21, 99]
     cold = build_plan(
         first_tokens,
@@ -169,14 +172,10 @@ def test_device_cache_prepares_stable_slots_and_reuses_lru() -> None:
     slot_a = cache.lookup("a")
     assert slot_a is not None
 
-    cache.prepare(
-        [{"segments": [{"hash": "b", "cacheable": True, "hit": False}]}]
-    )
+    cache.prepare([{"segments": [{"hash": "b", "cacheable": True, "hit": False}]}])
     slot_b = cache.lookup("b")
     assert slot_b is not None and slot_b != slot_a
-    cache.prepare(
-        [{"segments": [{"hash": "c", "cacheable": True, "hit": False}]}]
-    )
+    cache.prepare([{"segments": [{"hash": "c", "cacheable": True, "hit": False}]}])
     assert cache.lookup("a") is None
     assert cache.lookup("c") == slot_a
 
@@ -184,28 +183,20 @@ def test_device_cache_prepares_stable_slots_and_reuses_lru() -> None:
 def test_device_cache_rejects_unprepared_scheduler_hit() -> None:
     cache = DeviceSegmentCache(2)
     with pytest.raises(RuntimeError, match="cache divergence"):
-        cache.prepare(
-            [{"segments": [{"hash": "missing", "cacheable": True, "hit": True}]}]
-        )
+        cache.prepare([{"segments": [{"hash": "missing", "cacheable": True, "hit": True}]}])
 
 
 def test_device_cache_rejects_lru_order_divergence_before_reserve() -> None:
     cache = DeviceSegmentCache(2)
-    cache.prepare(
-        [{"segments": [{"hash": "A", "cacheable": True, "hit": False}]}]
-    )
-    cache.prepare(
-        [{"segments": [{"hash": "B", "cacheable": True, "hit": False}]}]
-    )
+    cache.prepare([{"segments": [{"hash": "A", "cacheable": True, "hit": False}]}])
+    cache.prepare([{"segments": [{"hash": "B", "cacheable": True, "hit": False}]}])
 
     with pytest.raises(RuntimeError, match="cache order divergence"):
         cache.prepare(
             [
                 {
                     "cache_order_before": ("B", "A"),
-                    "segments": [
-                        {"hash": "C", "cacheable": True, "hit": False}
-                    ],
+                    "segments": [{"hash": "C", "cacheable": True, "hit": False}],
                 }
             ]
         )
@@ -310,10 +301,7 @@ def test_hypic_attention_keeps_batched_request_prefixes_independent() -> None:
         hypic_key_pool=torch.empty((8, 2, 1, 2)),
         hypic_value_pool=torch.empty((8, 2, 1, 2)),
     )
-    query = torch.tensor(
-        [[[1.0, 0.0]], [[0.5, 1.0]], [[1.0, 1.0]],
-         [[-1.0, 0.0]], [[0.0, 1.0]], [[-1.0, 1.0]]]
-    )
+    query = torch.tensor([[[1.0, 0.0]], [[0.5, 1.0]], [[1.0, 1.0]], [[-1.0, 0.0]], [[0.0, 1.0]], [[-1.0, 1.0]]])
     key = query.clone()
     value = torch.arange(12, dtype=torch.float32).view(6, 1, 2)
     output = torch.empty((6, 2))
@@ -414,3 +402,68 @@ def test_hypic_gdn_dispatches_each_packed_request(monkeypatch) -> None:
     )
 
     assert calls == [("first", 0, 2), ("second", 1, 3)]
+
+
+def test_pic_attention_duplicate_miss_keeps_unique_writer() -> None:
+    config = HypicConfig(chunk_size=2, seam_sink_tokens=0)
+    cold = build_plan([1, 2, 3], {}, config)
+    plans, step = PicCatalog(1).prepare({"first": cold, "second": cold})
+    cache = PicDeviceCache(1)
+    cache.prepare(plans, step)
+    context = HypicBatchContext(plans, ("first", "second"), cache)
+    layer = SimpleNamespace(
+        layer_name="attn",
+        hypic_rotary_emb=SimpleNamespace(
+            is_neox_style=True, rotary_dim=2, cos_sin_cache=torch.tensor([[1.0, 0.0]] * 3)
+        ),
+        hypic_key_pool=torch.empty((1, 2, 1, 2)),
+        hypic_value_pool=torch.empty((1, 2, 1, 2)),
+    )
+    query = torch.ones((6, 1, 2))
+    value = torch.arange(12, dtype=torch.float32).reshape(6, 1, 2)
+    output = torch.empty((6, 2))
+    forward_hypic_attention(layer, query, query, value, output, context, scale=1.0, kv_cache=(), attn_metadata=None)
+    torch.testing.assert_close(layer.hypic_value_pool[0], value[:2])
+    # The second occurrence still computes its own context-dependent output.
+    for start in (0, 3):
+        expected = reference_suffix_attention(
+            query[start : start + 3], query[start : start + 3], value[start : start + 3], scale=1.0
+        )
+        torch.testing.assert_close(output[start : start + 3], expected.reshape(3, 2))
+
+
+def test_pic_gdn_compute_only_uses_all_request_state_indices(monkeypatch) -> None:
+    """No persistent slot is needed for an uncached miss, including short rows."""
+    config = HypicConfig(chunk_size=2, seam_sink_tokens=1)
+    plans, step = PicCatalog(1).prepare(
+        {
+            "first": build_plan([1, 2, 3], {}, config),
+            "second": build_plan([4, 5, 6], {}, config),
+        }
+    )
+    cache = PicDeviceCache(1)
+    cache.prepare(plans, step)
+    context = HypicBatchContext(plans, ("first", "second"), cache)
+    layer = SimpleNamespace(
+        prefix="gdn",
+        conv1d=SimpleNamespace(weight=torch.empty((6, 1, 2))),
+        hypic_conv_pool=torch.empty((1, 1, 6)),
+        hypic_zero_state_pool=torch.empty((1, 1, 2, 2)),
+        hypic_transition_pool=torch.empty((1, 1, 2, 2)),
+        kv_cache=(torch.zeros((8, 1, 6)), torch.zeros((8, 1, 2, 2))),
+        A_log=torch.zeros(1),
+        dt_bias=torch.zeros(1),
+        rearrange_mixed_qkv=lambda raw: tuple(part.reshape(1, -1, 1, 2) for part in raw.chunk(3, dim=-1)),
+    )
+    monkeypatch.setattr("vllm_ascend.hypic.gdn._causal_conv", lambda layer, raw, history: (raw, raw[-1:]))
+    monkeypatch.setattr("vllm_ascend.hypic.gdn.DeviceOperator.fused_gdn_gating", lambda log, a, b, bias: (a, b))
+    monkeypatch.setattr("vllm_ascend.hypic.gdn._run_gdn", lambda layer, q, k, v, g, beta, initial, cu: (q, initial + 1))
+    metadata = SimpleNamespace(
+        num_actual_tokens=6, non_spec_state_indices_tensor=torch.tensor([3, 7]), prefill_state_indices=torch.tensor([7])
+    )
+    raw = torch.arange(36, dtype=torch.float32).reshape(6, 6)
+    forward_hypic_gdn(layer, raw, torch.zeros((6, 1)), torch.zeros((6, 1)), torch.empty((6, 1, 2)), context, metadata)
+    torch.testing.assert_close(layer.kv_cache[0][3], raw[2:3])
+    torch.testing.assert_close(layer.kv_cache[0][7], raw[5:6])
+    assert layer.kv_cache[1][3].abs().sum() > 0
+    assert layer.kv_cache[1][7].abs().sum() > 0

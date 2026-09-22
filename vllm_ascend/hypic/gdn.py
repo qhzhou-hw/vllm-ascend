@@ -102,8 +102,9 @@ def _forward_hypic_gdn_request(
         raw = mixed_qkv[packed_offset : packed_offset + query_len]
         part_a = a[packed_offset : packed_offset + query_len]
         part_b = b[packed_offset : packed_offset + query_len]
-        slot = context.cache.lookup(segment["hash"]) if segment["cacheable"] else None
-        if segment["cacheable"] and slot is None:
+        store = segment.get("store", segment["cacheable"])
+        slot = context.cache.lookup(segment["hash"]) if hit or store else None
+        if (hit or store) and slot is None:
             raise RuntimeError(
                 f"HYPIC scheduler/worker GDN cache divergence for segment {segment['hash']} at {layer_name}"
             )
@@ -122,7 +123,7 @@ def _forward_hypic_gdn_request(
             history = conv_pool[slot]
         else:
             history = raw_tail
-            if segment["cacheable"]:
+            if store:
                 conv_pool[slot].copy_(history)
                 history = conv_pool[slot]
             seam = int(segment["recompute_seam"])
@@ -130,11 +131,12 @@ def _forward_hypic_gdn_request(
                 units.append({"segment": segment, "kind": "seam", "length": seam})
                 interior_index = len(units)
                 units.append({"segment": segment, "kind": "interior", "length": length - seam})
-                cache_writes.append((segment, interior_index, slot))
+                if store:
+                    cache_writes.append((segment, interior_index, slot))
             else:
                 unit_index = len(units)
                 units.append({"segment": segment, "kind": "full", "length": length})
-                if segment["cacheable"]:
+                if store:
                     cache_writes.append((segment, unit_index, slot))
         packed_offset += query_len
 
@@ -194,9 +196,7 @@ def _forward_hypic_gdn_request(
         if hit:
             slot = context.cache.lookup(segment["hash"])
             if slot is None:
-                raise RuntimeError(
-                    f"HYPIC GDN slot disappeared for segment {segment['hash']} at {layer_name}"
-                )
+                raise RuntimeError(f"HYPIC GDN slot disappeared for segment {segment['hash']} at {layer_name}")
             accumulated = _compose(
                 accumulated,
                 transition_pool[slot],
@@ -213,11 +213,14 @@ def _forward_hypic_gdn_request(
             )
             unit_cursor += 1
 
-    state_indices = attn_metadata.prefill_state_indices
+    # Native metadata may classify a one-query sparse prefill as a decode.
+    # The non-spec indices cover *all* request rows, including those short
+    # prefills; prefill_state_indices alone drops such rows.
+    state_indices = getattr(attn_metadata, "non_spec_state_indices_tensor", None)
+    if state_indices is None:
+        state_indices = attn_metadata.prefill_state_indices
     if state_indices is None or request_index >= len(state_indices):
-        raise RuntimeError(
-            f"HYPIC GDN state metadata is missing request {request_index}"
-        )
+        raise RuntimeError(f"HYPIC GDN state metadata is missing request {request_index}")
     state_index = state_indices[request_index].to(torch.long)
     layer.kv_cache[1][state_index] = accumulated.to(layer.kv_cache[1].dtype)
     layer.kv_cache[0][state_index] = history.to(layer.kv_cache[0].dtype)
@@ -262,6 +265,4 @@ def forward_hypic_gdn(
 
     num_actual_tokens = int(attn_metadata.num_actual_tokens)
     if packed_offset != num_actual_tokens:
-        raise RuntimeError(
-            f"HYPIC GDN consumed {packed_offset} of {num_actual_tokens} packed tokens"
-        )
+        raise RuntimeError(f"HYPIC GDN consumed {packed_offset} of {num_actual_tokens} packed tokens")

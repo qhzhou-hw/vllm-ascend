@@ -164,16 +164,12 @@ def _hydrate_paged_kv_cache(
         raise RuntimeError("HYPIC requires a writable paged KV cache")
     block_tables = getattr(attn_metadata, "block_tables", None)
     if block_tables is None or request_index >= block_tables.shape[0]:
-        raise RuntimeError(
-            f"HYPIC paged-cache block table is missing request {request_index}"
-        )
+        raise RuntimeError(f"HYPIC paged-cache block table is missing request {request_index}")
 
     block_size = int(kv_cache[0].shape[1])
     positions = torch.arange(start, start + key.shape[0], device=key.device)
     logical_blocks = torch.div(positions, block_size, rounding_mode="floor")
-    physical_blocks = block_tables[request_index].index_select(
-        0, logical_blocks.to(block_tables.device, torch.long)
-    )
+    physical_blocks = block_tables[request_index].index_select(0, logical_blocks.to(block_tables.device, torch.long))
     slots = physical_blocks.to(torch.long) * block_size + positions.remainder(block_size)
     if bool((slots < 0).any().item()):
         raise RuntimeError("HYPIC paged-cache block table contains an unallocated block")
@@ -264,7 +260,7 @@ def forward_hypic_attention(
                 segment_value = current_value
                 attention_key = torch.cat(prefix_keys + [segment_key])
                 attention_value = torch.cat(prefix_values + [segment_value])
-                if segment["cacheable"]:
+                if segment.get("store", segment["cacheable"]):
                     absolute_positions = torch.arange(start, end, device=key.device)
                     local_positions = torch.arange(length, device=key.device)
                     public_key = rerotate_keys(
@@ -276,8 +272,7 @@ def forward_hypic_attention(
                     slot = context.cache.lookup(segment["hash"])
                     if slot is None:
                         raise RuntimeError(
-                            "HYPIC static slot was not prepared for segment "
-                            f"{segment['hash']} at {layer_name}"
+                            f"HYPIC static slot was not prepared for segment {segment['hash']} at {layer_name}"
                         )
                     key_pool[slot, :length].copy_(public_key)
                     value_pool[slot, :length].copy_(segment_value)

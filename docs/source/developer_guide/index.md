@@ -17,6 +17,8 @@ Explore the design documents covering patch architecture, CPU binding, model run
 
 - **[HYPIC Ascend 适配说明](hypic_ascend_porting_zh.md)** — HYPIC 在 vLLM Ascend 上的架构、迁移步骤、验证方法和注意事项
 - **[HYPIC Segment Cache 一致性修复](hypic_cache_consistency_fix_zh.md)** — Scheduler/worker LRU 分叉、权威驱逐协议和回归方法
+- **[PIC 前缀无关缓存实现方案](hypic_pic_scheduler_plan_zh.md)** — 内容匹配、调度准入、槽位生命周期及普通前缀缓存兼容设计
+- **[PIC 首版实现与验证清单](hypic_pic_implementation_zh.md)** — 调度兼容层、已完成检查及待 Ascend 验证项目
 
 ## Evaluation
 

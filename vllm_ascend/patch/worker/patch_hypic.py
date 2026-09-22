@@ -12,15 +12,20 @@ from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
 from vllm.model_executor.models.qwen3_next import Qwen3NextAttention
 from vllm.platforms import current_platform
 
-from vllm_ascend.attention.attention_v1 import AscendAttentionBackendImpl
+from vllm_ascend.attention.attention_v1 import AscendAttentionBackendImpl, AscendAttentionState
 from vllm_ascend.hypic.attention import forward_hypic_attention
-from vllm_ascend.hypic.cache import DeviceSegmentCache
 from vllm_ascend.hypic.config import get_hypic_config
 from vllm_ascend.hypic.gdn import forward_hypic_gdn
+from vllm_ascend.hypic.pic_cache import PicDeviceCache
 from vllm_ascend.hypic.runtime import (
     HypicBatchContext,
     current_hypic_context,
     set_hypic_context,
+)
+from vllm_ascend.hypic.vllm_adapter import (
+    PicSchedulerOutput,
+    acknowledge_output,
+    worker_input_output,
 )
 from vllm_ascend.ops.gdn import AscendGatedDeltaNetAttention
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
@@ -32,6 +37,9 @@ _ORIGINAL_PREPARE_INPUTS = NPUModelRunner._prepare_inputs
 _ORIGINAL_ATTENTION_FORWARD = AscendAttentionBackendImpl.forward
 _ORIGINAL_ATTENTION_IMPL = AscendAttentionBackendImpl.forward_impl
 _ORIGINAL_GDN_CORE = QwenGatedDeltaNetAttention._forward_core
+_ORIGINAL_EXECUTE_MODEL = NPUModelRunner.execute_model
+_ORIGINAL_SAMPLE_TOKENS = NPUModelRunner.sample_tokens
+_ORIGINAL_BUILD_ATTN_STATE = NPUModelRunner._build_attn_state
 
 
 def _qwen_init(self: Qwen3NextAttention, *args: Any, **kwargs: Any) -> None:
@@ -101,15 +109,15 @@ def _gdn_init(
 
 
 def _update_states(self: NPUModelRunner, scheduler_output: Any) -> Any:
+    self.hypic_sparse_prefill = isinstance(scheduler_output, PicSchedulerOutput)
     config = get_hypic_config(self.vllm_config)
     if config.enabled:
         if not hasattr(self, "hypic_device_cache"):
-            self.hypic_device_cache = DeviceSegmentCache(config.max_cache_segments)
+            self.hypic_device_cache = PicDeviceCache(config.max_cache_segments)
             self.hypic_plans = {}
-        for request_data in scheduler_output.scheduled_new_reqs:
-            plan = getattr(request_data, "hypic_plan", None)
-            if plan is not None:
-                self.hypic_plans[request_data.req_id] = plan
+        if isinstance(scheduler_output, PicSchedulerOutput):
+            self.hypic_plans.update(scheduler_output.pic_plans)
+            scheduler_output = worker_input_output(scheduler_output)
         for request_id in scheduler_output.finished_req_ids:
             self.hypic_plans.pop(request_id, None)
     return _ORIGINAL_UPDATE_STATES(self, scheduler_output)
@@ -126,11 +134,7 @@ def _prepare_inputs(
         set_hypic_context(None)
         return result
 
-    planned_request_ids = tuple(
-        request_data.req_id
-        for request_data in scheduler_output.scheduled_new_reqs
-        if request_data.req_id in self.hypic_plans
-    )
+    planned_request_ids = tuple(scheduler_output.pic_plans) if isinstance(scheduler_output, PicSchedulerOutput) else ()
     new_request_ids = set(planned_request_ids)
     active_ids = tuple(
         request_id
@@ -141,22 +145,11 @@ def _prepare_inputs(
         set_hypic_context(None)
         return result
     if tuple(self.input_batch.req_ids) != active_ids:
-        raise RuntimeError(
-            "HYPIC requires a prefill-only batch; mixed prefill/decode "
-            "forward detected"
-        )
-    if active_ids != planned_request_ids:
-        raise RuntimeError(
-            "HYPIC scheduler/worker request order divergence: "
-            f"scheduler={planned_request_ids}, worker={active_ids}"
-        )
-
+        raise RuntimeError("HYPIC requires a prefill-only batch; mixed prefill/decode forward detected")
     # Assign every active segment a stable slot before the first model layer.
     # All attention and GDN layers then read/write the same slot id without
     # mutating the LRU while a packed forward is in progress.
-    self.hypic_device_cache.prepare(
-        self.hypic_plans[request_id] for request_id in active_ids
-    )
+    self.hypic_device_cache.prepare(scheduler_output.pic_plans, scheduler_output.pic_step)
 
     total = int(scheduler_output.total_num_scheduled_tokens)
     packed_offset = 0
@@ -166,23 +159,18 @@ def _prepare_inputs(
         scheduled = int(num_scheduled_tokens[row_index])
         if len(positions) != scheduled:
             raise RuntimeError(
-                f"HYPIC request {request_id} scheduled {scheduled} tokens "
-                f"for {len(positions)} query positions"
+                f"HYPIC request {request_id} scheduled {scheduled} tokens for {len(positions)} query positions"
             )
         packed_end = packed_offset + scheduled
         token_row = self.input_batch.token_ids_cpu[row_index]
         selected_ids = torch.from_numpy(token_row[positions]).to(torch.int32)
         self.input_ids.cpu[packed_offset:packed_end].copy_(selected_ids)
-        self.input_ids.gpu[packed_offset:packed_end].copy_(
-            selected_ids.to(self.device)
-        )
+        self.input_ids.gpu[packed_offset:packed_end].copy_(selected_ids.to(self.device))
         position_tensor = torch.from_numpy(positions).to(self.device)
         self.positions[packed_offset:packed_end].copy_(position_tensor)
         packed_offset = packed_end
     if packed_offset != total:
-        raise RuntimeError(
-            f"HYPIC packed {packed_offset} tokens for a {total}-token batch"
-        )
+        raise RuntimeError(f"HYPIC packed {packed_offset} tokens for a {total}-token batch")
     self.input_batch.block_table.compute_slot_mapping(
         len(active_ids),
         self.query_start_loc.gpu[: len(active_ids) + 1],
@@ -192,10 +180,7 @@ def _prepare_inputs(
         HypicBatchContext(
             # Snapshot every plan in this packed prefill. The loop variables
             # above otherwise retain only the final request's plan.
-            plans={
-                request_id: self.hypic_plans[request_id]
-                for request_id in active_ids
-            },
+            plans={request_id: self.hypic_plans[request_id] for request_id in active_ids},
             request_ids=active_ids,
             cache=self.hypic_device_cache,
         )
@@ -219,20 +204,11 @@ def _attention_forward(self: AscendAttentionBackendImpl, layer: Any, *args: Any,
                 dtype=torch.long,
                 device=metadata.block_tables.device,
             )
-            logical_blocks = torch.div(
-                positions, block_size, rounding_mode="floor"
-            )
-            physical_blocks = metadata.block_tables[request_index].index_select(
-                0, logical_blocks
-            )
-            slots = (
-                physical_blocks.to(torch.long) * block_size
-                + positions.remainder(block_size)
-            )
+            logical_blocks = torch.div(positions, block_size, rounding_mode="floor")
+            physical_blocks = metadata.block_tables[request_index].index_select(0, logical_blocks)
+            slots = physical_blocks.to(torch.long) * block_size + positions.remainder(block_size)
             packed_end = packed_offset + len(slots)
-            metadata.slot_mapping[packed_offset:packed_end].copy_(
-                slots.to(torch.int32)
-            )
+            metadata.slot_mapping[packed_offset:packed_end].copy_(slots.to(torch.int32))
             packed_offset = packed_end
     return _ORIGINAL_ATTENTION_FORWARD(self, layer, *args, **kwargs)
 
@@ -249,7 +225,7 @@ def _attention_impl(
     context = current_hypic_context()
     if context is None:
         return _ORIGINAL_ATTENTION_IMPL(self, query, key, value, kv_cache, attn_metadata, output)
-    return forward_hypic_attention(
+    result = forward_hypic_attention(
         self.hypic_layer,
         query[: attn_metadata.num_actual_tokens],
         key[: attn_metadata.num_actual_tokens],
@@ -260,6 +236,8 @@ def _attention_impl(
         kv_cache=kv_cache,
         attn_metadata=attn_metadata,
     )
+    context.cache.mark_layer("attention:" + str(self.hypic_layer.layer_name))
+    return result
 
 
 def _gdn_core(
@@ -276,12 +254,71 @@ def _gdn_core(
 
     metadata = get_forward_context().attn_metadata[self.prefix]
     forward_hypic_gdn(self, mixed_qkv, b, a, core_attn_out, context, metadata)
+    context.cache.mark_layer("gdn:" + str(self.prefix))
+
+
+def _execute_model(self: NPUModelRunner, scheduler_output: Any, *args: Any, **kwargs: Any) -> Any:
+    # Acknowledgement is emitted only after every pool-bearing layer on every
+    # TP rank has completed, including asynchronous NPU copies. This explicit
+    # synchronization is intentional in the first, synchronous PIC adapter.
+    if getattr(self, "hypic_pending_ack", None) is not None:
+        raise RuntimeError("PIC sample_tokens must consume the previous acknowledgement")
+    try:
+        output = _ORIGINAL_EXECUTE_MODEL(self, scheduler_output, *args, **kwargs)
+        if not isinstance(scheduler_output, PicSchedulerOutput):
+            return output
+        expected_layers = set()
+        for module in self.model.modules():
+            if hasattr(module, "hypic_key_pool"):
+                expected_layers.add("attention:" + str(module.layer_name))
+            if hasattr(module, "hypic_transition_pool"):
+                expected_layers.add("gdn:" + str(module.prefix))
+        cache = self.hypic_device_cache
+        complete = bool(expected_layers) and cache.completed_layers == expected_layers
+        # Use the same stream as the forward and then join all TP ranks. A
+        # non-sampling rank must not be allowed to publish an incomplete fill.
+        torch.npu.synchronize()
+        ranks = self.vllm_config.parallel_config.tensor_parallel_size
+        count = torch.tensor([int(complete)], dtype=torch.int32, device=self.device)
+        if ranks > 1:
+            from vllm.distributed import get_tp_group
+
+            count = get_tp_group().all_reduce(count)
+        if int(count.item()) != ranks:
+            raise RuntimeError("PIC not all TP ranks completed every cache layer")
+        ack = cache.acknowledge(completed_ranks=ranks, expected_layers=expected_layers)
+        if output is not None:
+            return acknowledge_output(output, ack)
+        self.hypic_pending_ack = ack
+        return None
+    finally:
+        # Do not leak sparse dispatch into native forwards or profiling.
+        set_hypic_context(None)
+
+
+def _sample_tokens(self: NPUModelRunner, *args: Any, **kwargs: Any) -> Any:
+    output = _ORIGINAL_SAMPLE_TOKENS(self, *args, **kwargs)
+    ack = getattr(self, "hypic_pending_ack", None)
+    if ack is not None:
+        output = acknowledge_output(output, ack)
+        self.hypic_pending_ack = None
+    return output
+
+
+def _build_attn_state(self: NPUModelRunner, *args: Any, **kwargs: Any) -> Any:
+    if getattr(self, "hypic_sparse_prefill", False):
+        self.attn_state = AscendAttentionState.PrefillCacheHit
+        return self.attn_state
+    return _ORIGINAL_BUILD_ATTN_STATE(self, *args, **kwargs)
 
 
 Qwen3NextAttention.__init__ = _qwen_init
 QwenGatedDeltaNetAttention.__init__ = _gdn_init
 NPUModelRunner._update_states = _update_states
 NPUModelRunner._prepare_inputs = _prepare_inputs
+NPUModelRunner.execute_model = _execute_model
+NPUModelRunner.sample_tokens = _sample_tokens
+NPUModelRunner._build_attn_state = _build_attn_state
 AscendAttentionBackendImpl.forward = _attention_forward
 AscendAttentionBackendImpl.forward_impl = _attention_impl
 QwenGatedDeltaNetAttention._forward_core = _gdn_core

@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from vllm_ascend.hypic.cache import DeviceSegmentCache
+from vllm_ascend.hypic.pic_cache import PicDeviceCache
 
 
 @dataclass(frozen=True)
@@ -17,7 +18,7 @@ class HypicBatchContext:
 
     plans: dict[str, dict[str, Any]]
     request_ids: tuple[str, ...]
-    cache: DeviceSegmentCache
+    cache: DeviceSegmentCache | PicDeviceCache
 
 
 _CURRENT: ContextVar[HypicBatchContext | None] = ContextVar("vllm_ascend_hypic_context", default=None)

@@ -2,18 +2,23 @@
 
 from __future__ import annotations
 
-import math
+import inspect
 from typing import Any
 
 from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.core.sched.interface import PauseState
-from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.core.sched.scheduler import Scheduler
 
-from vllm_ascend.hypic.cache import SegmentCatalog
 from vllm_ascend.hypic.config import get_hypic_config
+from vllm_ascend.hypic.pic_cache import PicCatalog
 from vllm_ascend.hypic.planner import build_plan
+from vllm_ascend.hypic.protocol import request_policy
+from vllm_ascend.hypic.vllm_adapter import (
+    PicSchedulerOutput,
+    logical_scheduler_output,
+    pack_scheduler_output,
+)
 from vllm_ascend.platform import NPUPlatform
 
 logger = init_logger(__name__)
@@ -24,8 +29,9 @@ _ORIGINAL_SCHEDULER_INIT = Scheduler.__init__
 _ORIGINAL_SCHEDULE = Scheduler.schedule
 _ORIGINAL_MAMBA_SPLIT = Scheduler._mamba_block_aligned_split
 _ORIGINAL_GET_COMPUTED_BLOCKS = KVCacheManager.get_computed_blocks
-_ORIGINAL_NEW_REQUEST = NewRequestData.from_request.__func__
 _ORIGINAL_UPDATE_FROM_OUTPUT = Scheduler.update_from_output
+_ORIGINAL_ALLOCATE_SLOTS = KVCacheManager.allocate_slots
+_ALLOCATE_SIGNATURE = inspect.signature(_ORIGINAL_ALLOCATE_SLOTS)
 
 
 def _check_and_update_config(cls: type, vllm_config: Any) -> None:
@@ -62,19 +68,12 @@ def _check_and_update_config(cls: type, vllm_config: Any) -> None:
         if vllm_config.kv_transfer_config is not None:
             raise ValueError("HYPIC does not support KV transfer/disaggregation")
 
-        max_batched_tokens = int(
-            vllm_config.scheduler_config.max_num_batched_tokens
-        )
-        required_slots = max(
-            1, math.ceil(max_batched_tokens / config.chunk_size) - 1
-        )
-        if config.max_cache_segments < required_slots:
-            raise ValueError(
-                "hypic_config.max_cache_segments must be at least "
-                f"{required_slots} for max_num_batched_tokens="
-                f"{max_batched_tokens} and chunk_size={config.chunk_size}; "
-                "all cacheable segments in one packed forward need stable slots"
-            )
+        if getattr(vllm_config, "lora_config", None) is not None:
+            raise ValueError("PIC adapter-specific tensor pools are not implemented")
+        if getattr(model_config, "enable_return_routed_experts", False):
+            raise ValueError("PIC does not support returning routed experts")
+        if getattr(model_config, "quantization", None) is not None:
+            raise ValueError("PIC quantized payloads are not implemented")
 
         model_config.enforce_eager = True
         # SegmentCatalog commits misses only after the corresponding model
@@ -82,13 +81,14 @@ def _check_and_update_config(cls: type, vllm_config: Any) -> None:
         # uncommitted state while the worker has already reserved its slots.
         vllm_config.scheduler_config.async_scheduling = False
         vllm_config.scheduler_config.enable_chunked_prefill = False
+        vllm_config.scheduler_config.long_prefill_token_threshold = 0
         # Hybrid models otherwise retain a 2048-token scheduling cap even when
         # max_num_batched_tokens is larger. HYPIC must plan and execute a whole
         # prompt atomically because its query positions are non-contiguous.
         vllm_config.scheduler_config.max_num_scheduled_tokens = vllm_config.scheduler_config.max_num_batched_tokens
         # Keep vLLM prefix caching enabled so its hybrid-cache page-size
-        # validation remains satisfied.  HYPIC bypasses standard cache hits in
-        # ``_get_computed_blocks`` and owns segment reuse independently.
+        # validation remains satisfied. PIC requests suppress both standard
+        # APC lookup and publication; prefix_only requests retain native APC.
         vllm_config.cache_config.mamba_cache_mode = "align"
         logger.info(
             "Enabled HYPIC transition_rope_recompute with chunk_size=%d, seam=%d",
@@ -102,8 +102,20 @@ def _scheduler_init(self: Scheduler, *args: Any, **kwargs: Any) -> None:
     config = get_hypic_config(self.vllm_config)
     if config.enabled:
         self.hypic_config = config
-        self.hypic_catalog = SegmentCatalog(config.max_cache_segments)
+        self.hypic_catalog = PicCatalog(config.max_cache_segments)
+        self.hypic_batch_kind = None
+        self.hypic_batch_units = 0
         self.kv_cache_manager.hypic_scheduler = self
+        # Guard the final publication boundary, including allocate-time and
+        # decode-time callers. Do not turn off hybrid block allocation itself.
+        coordinator = self.kv_cache_manager.coordinator
+        original_cache_blocks = coordinator.cache_blocks
+
+        def cache_blocks(request: Any, num_computed_tokens: int) -> None:
+            if request_policy(request) == "prefix_only":
+                original_cache_blocks(request, num_computed_tokens)
+
+        coordinator.cache_blocks = cache_blocks
 
 
 def _schedule(self: Scheduler, *args: Any, **kwargs: Any) -> Any:
@@ -114,11 +126,15 @@ def _schedule(self: Scheduler, *args: Any, **kwargs: Any) -> Any:
     admits another HYPIC prefill group. This preserves ordinary batched decode
     while avoiding a mixed custom-prefill/standard-decode model forward.
     """
-    if (
-        hasattr(self, "hypic_catalog")
-        and self.running
-        and self._pause_state == PauseState.UNPAUSED
-    ):
+    catalog = getattr(self, "hypic_catalog", None)
+    if catalog is not None:
+        if catalog.failed:
+            raise RuntimeError("PIC execution failed; restart the engine")
+        if catalog.pending is not None:
+            raise RuntimeError("PIC previous step has not completed")
+        self.hypic_batch_kind = None
+        self.hypic_batch_units = 0
+    if hasattr(self, "hypic_catalog") and self.running and self._pause_state == PauseState.UNPAUSED:
         self._pause_state = PauseState.PAUSED_NEW
         try:
             scheduler_output = _ORIGINAL_SCHEDULE(self, *args, **kwargs)
@@ -127,17 +143,59 @@ def _schedule(self: Scheduler, *args: Any, **kwargs: Any) -> Any:
     else:
         scheduler_output = _ORIGINAL_SCHEDULE(self, *args, **kwargs)
 
-    catalog = getattr(self, "hypic_catalog", None)
     if catalog is not None:
-        # Cache lookup may happen for a waiting request that is later rejected
-        # by token or block budgets. Only admitted requests may mutate the
-        # scheduler LRU, because only those plans reach the worker.
-        catalog.prepare_scheduled_plans(
-            plan
-            for request_data in scheduler_output.scheduled_new_reqs
-            if (plan := getattr(request_data, "hypic_plan", None)) is not None
-        )
+        plans = {
+            data.req_id: self.requests[data.req_id].hypic_plan
+            for data in scheduler_output.scheduled_new_reqs
+            if getattr(self.requests[data.req_id], "hypic_plan", None) is not None
+        }
+        if plans:
+            if set(plans) != set(scheduler_output.num_scheduled_tokens):
+                raise RuntimeError("PIC requires a homogeneous prefill batch")
+            prepared, step = catalog.prepare(plans)
+            try:
+                logger.debug(
+                    "PIC step=%d logical_tokens=%d query_tokens=%d restore_tokens=%d "
+                    "units=%d reads=%d fills=%d evictions=%d",
+                    step.step_id,
+                    sum(plan["logical_advance"] for plan in prepared.values()),
+                    sum(plan["num_query_tokens"] for plan in prepared.values()),
+                    sum(plan["num_restore_tokens"] for plan in prepared.values()),
+                    sum(plan["num_prefill_units"] for plan in prepared.values()),
+                    len(step.reads),
+                    len(step.fills),
+                    sum(fill.victim is not None for fill in step.fills),
+                )
+                return pack_scheduler_output(scheduler_output, prepared, step)
+            except Exception:
+                catalog.abort(dispatched=False)
+                raise
     return scheduler_output
+
+
+def _allocate_slots(self: KVCacheManager, request: Any, *args: Any, **kwargs: Any) -> Any:
+    scheduler = getattr(self, "hypic_scheduler", None)
+    if scheduler is None:
+        return _ORIGINAL_ALLOCATE_SLOTS(self, request, *args, **kwargs)
+    policy = request_policy(request)
+    # A preempted request replays its full prompt + generated tokens through
+    # native execution. It retains PIC publication isolation but no old lease.
+    kind = "pic" if policy == "pic" and not request.num_preemptions else "native"
+    active_kind = scheduler.hypic_batch_kind
+    if active_kind is not None and active_kind != kind:
+        return None
+    plan = getattr(request, "hypic_plan", None)
+    units = plan["num_prefill_units"] if plan is not None and request.num_computed_tokens == 0 else 0
+    if scheduler.hypic_batch_units + units > scheduler.hypic_config.max_prefill_units:
+        return None
+    bound = _ALLOCATE_SIGNATURE.bind(self, request, *args, **kwargs)
+    if policy != "prefix_only":
+        bound.arguments["delay_cache_blocks"] = True
+    result = _ORIGINAL_ALLOCATE_SLOTS(*bound.args, **bound.kwargs)
+    if result is not None:
+        scheduler.hypic_batch_kind = kind
+        scheduler.hypic_batch_units += units
+    return result
 
 
 def _mamba_block_aligned_split(
@@ -147,7 +205,7 @@ def _mamba_block_aligned_split(
     num_new_local_computed_tokens: int = 0,
     num_external_computed_tokens: int = 0,
 ) -> int:
-    if hasattr(self, "hypic_catalog"):
+    if hasattr(self, "hypic_catalog") and request_policy(request) == "pic" and not request.num_preemptions:
         return num_new_tokens
     return _ORIGINAL_MAMBA_SPLIT(
         self,
@@ -162,14 +220,25 @@ def _get_computed_blocks(self: KVCacheManager, request: Any) -> tuple[Any, int, 
     scheduler = getattr(self, "hypic_scheduler", None)
     if scheduler is None:
         return _ORIGINAL_GET_COMPUTED_BLOCKS(self, request)
+    request.hypic_plan = None
+    policy = request_policy(request)
+    if policy == "prefix_only":
+        return _ORIGINAL_GET_COMPUTED_BLOCKS(self, request)
+    if policy == "full_recompute" or request.num_preemptions:
+        return self.empty_kv_cache_blocks, 0, 0
     if request.prompt_token_ids is None:
         raise ValueError("HYPIC requires token-id prompts")
+    if getattr(request, "mm_features", None) or getattr(request, "prompt_embeds", None) is not None:
+        raise ValueError("PIC currently requires text-only token-id prompts")
+    if request.num_tokens > scheduler.max_num_scheduled_tokens:
+        raise ValueError(
+            "PIC atomic admission requires max_num_batched_tokens >= prompt length; "
+            f"got {scheduler.max_num_scheduled_tokens} < {request.num_tokens}"
+        )
     if request.sampling_params is not None and getattr(request.sampling_params, "prompt_logprobs", None) is not None:
         raise ValueError("HYPIC does not support prompt logprobs")
     extra_args = (
-        getattr(request.sampling_params, "extra_args", None)
-        if request.sampling_params is not None
-        else None
+        getattr(request.sampling_params, "extra_args", None) if request.sampling_params is not None else None
     ) or {}
     segment_boundaries = extra_args.get("hypic_segment_boundaries")
     plan = build_plan(
@@ -177,64 +246,34 @@ def _get_computed_blocks(self: KVCacheManager, request: Any) -> tuple[Any, int, 
         scheduler.hypic_catalog.ready,
         scheduler.hypic_config,
         segment_boundaries=segment_boundaries,
+        cache_salt=getattr(request, "cache_salt", None),
     )
+    if plan["num_prefill_units"] > scheduler.hypic_config.max_prefill_units:
+        raise ValueError(
+            f"PIC prompt needs {plan['num_prefill_units']} GDN units, exceeding "
+            f"max_prefill_units={scheduler.hypic_config.max_prefill_units}; "
+            "increase the workspace budget or reduce semantic fragmentation"
+        )
     request.hypic_plan = plan
-    return self.empty_kv_cache_blocks, int(plan["num_computed_tokens"]), 0
-
-
-def _new_request_from_request(
-    cls: type,
-    request: Any,
-    block_ids: tuple[list[int], ...],
-    prefill_token_ids: list[int] | None = None,
-) -> NewRequestData:
-    data = _ORIGINAL_NEW_REQUEST(cls, request, block_ids, prefill_token_ids=prefill_token_ids)
-    plan = getattr(request, "hypic_plan", None)
-    if plan is not None:
-        data.hypic_plan = plan
-    return data
+    # Sparse reuse is not a contiguous computed prefix. The unmodified vLLM
+    # allocator reserves the full logical prompt; only worker query counts are
+    # reduced after admission and slot planning.
+    return self.empty_kv_cache_blocks, 0, 0
 
 
 def _update_from_output(self: Scheduler, scheduler_output: Any, model_runner_output: Any) -> Any:
-    plans = [getattr(data, "hypic_plan", None) for data in scheduler_output.scheduled_new_reqs]
-    result = _ORIGINAL_UPDATE_FROM_OUTPUT(self, scheduler_output, model_runner_output)
-    catalog = getattr(self, "hypic_catalog", None)
-    if catalog is not None:
-        expected_evicted = [
-            segment["expected_eviction"]
-            for plan in plans
-            if plan is not None
-            for segment in plan["segments"]
-            if segment.get("expected_eviction") is not None
-        ]
-        evicted: list[str] = []
-        for plan in plans:
-            if plan is not None:
-                evicted.extend(catalog.commit(plan))
-        if evicted != expected_evicted:
-            raise RuntimeError(
-                "HYPIC scheduler cache projection divergence: "
-                f"expected={expected_evicted}, actual={evicted}"
-            )
-        expected_order = next(
-            (
-                plan["cache_order_after_commit"]
-                for plan in reversed(plans)
-                if plan is not None and "cache_order_after_commit" in plan
-            ),
-            None,
-        )
-        if expected_order is not None and tuple(catalog.ready) != tuple(
-            expected_order
-        ):
-            raise RuntimeError(
-                "HYPIC scheduler cache order projection divergence: "
-                f"expected={tuple(expected_order)}, "
-                f"actual={tuple(catalog.ready)}"
-            )
-        if evicted:
-            logger.debug("HYPIC scheduler evicted %d segments", len(evicted))
-    return result
+    if not isinstance(scheduler_output, PicSchedulerOutput):
+        return _ORIGINAL_UPDATE_FROM_OUTPUT(self, scheduler_output, model_runner_output)
+    catalog = self.hypic_catalog
+    ack = getattr(model_runner_output, "pic_ack", None)
+    try:
+        if ack is None:
+            raise RuntimeError("PIC worker did not acknowledge all layer writes")
+        catalog.commit(ack, expected_ranks=self.vllm_config.parallel_config.tensor_parallel_size)
+        return _ORIGINAL_UPDATE_FROM_OUTPUT(self, logical_scheduler_output(scheduler_output), model_runner_output)
+    except Exception:
+        catalog.abort(dispatched=True)
+        raise
 
 
 NPUPlatform.check_and_update_config = classmethod(_check_and_update_config)
@@ -242,5 +281,5 @@ Scheduler.__init__ = _scheduler_init
 Scheduler.schedule = _schedule
 Scheduler._mamba_block_aligned_split = _mamba_block_aligned_split
 KVCacheManager.get_computed_blocks = _get_computed_blocks
-NewRequestData.from_request = classmethod(_new_request_from_request)
+KVCacheManager.allocate_slots = _allocate_slots
 Scheduler.update_from_output = _update_from_output

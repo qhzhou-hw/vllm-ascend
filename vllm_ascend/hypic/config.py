@@ -16,6 +16,9 @@ class HypicConfig:
     # Segment tensors use fixed model-owned pools, so vLLM accounts for their
     # memory before sizing the ordinary hybrid KV cache.
     max_cache_segments: int = 96
+    # Bounds the FP32 S/T workspaces independently of token/slot budgets.
+    # Semantic boundaries may create many short units even in a short prompt.
+    max_prefill_units: int = 256
     mode: str = "transition_rope_recompute"
 
     @classmethod
@@ -42,6 +45,8 @@ class HypicConfig:
             raise ValueError("hypic_config.seam_sink_tokens must be smaller than chunk_size")
         if self.max_cache_segments <= 0:
             raise ValueError("hypic_config.max_cache_segments must be positive")
+        if self.max_prefill_units <= 0:
+            raise ValueError("hypic_config.max_prefill_units must be positive")
 
 
 def get_hypic_config(vllm_config: Any) -> HypicConfig:
