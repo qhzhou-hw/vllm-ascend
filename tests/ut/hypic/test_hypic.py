@@ -29,6 +29,43 @@ def test_config_defaults_to_requested_chunk_size() -> None:
     assert config.chunk_size == 512
     assert config.seam_sink_tokens == 8
     assert config.max_cache_segments == 96
+    assert config.reset_conv_history is False
+
+
+def test_config_accepts_conv_history_reset() -> None:
+    config = get_hypic_config(SimpleNamespace(additional_config={"hypic_config": {"reset_conv_history": True}}))
+    assert config.reset_conv_history is True
+
+
+@pytest.mark.parametrize("value", ["false", "true", 0, 1, None])
+def test_config_rejects_non_boolean_conv_history_reset(value) -> None:
+    with pytest.raises(ValueError, match="reset_conv_history must be a boolean"):
+        HypicConfig.from_dict({"reset_conv_history": value})
+
+
+def test_plan_separates_conv_history_cache_semantics() -> None:
+    tokens = list(range(7))
+    legacy = build_plan(tokens, {}, HypicConfig(chunk_size=4, seam_sink_tokens=0))
+    explicit_default = build_plan(tokens, {}, HypicConfig(chunk_size=4, seam_sink_tokens=0, reset_conv_history=False))
+    assert legacy == explicit_default
+    catalog = SegmentCatalog(8)
+    catalog.commit(legacy)
+    config = HypicConfig(chunk_size=4, seam_sink_tokens=0, reset_conv_history=True)
+    reset = build_plan(tokens, catalog.ready, config)
+    validate_plan(reset)
+    assert reset["reset_conv_history"] is True
+    assert not any(segment["hit"] for segment in reset["segments"])
+    assert reset["segments"][0]["hash"] != legacy["segments"][0]["hash"]
+    catalog.commit(reset)
+    warm = build_plan(tokens, catalog.ready, config)
+    assert warm["segments"][0]["hit"]
+    # Older workers/plans must not silently ignore the new graph semantics.
+    legacy["version"] = 2
+    with pytest.raises(ValueError, match="Unsupported HYPIC plan version"):
+        validate_plan(legacy)
+    reset["reset_conv_history"] = "true"
+    with pytest.raises(ValueError, match="reset_conv_history must be a boolean"):
+        validate_plan(reset)
 
 
 def test_config_rejects_unknown_mode() -> None:
@@ -432,9 +469,10 @@ def test_pic_attention_duplicate_miss_keeps_unique_writer() -> None:
         torch.testing.assert_close(output[start : start + 3], expected.reshape(3, 2))
 
 
-def test_pic_gdn_compute_only_uses_all_request_state_indices(monkeypatch) -> None:
+@pytest.mark.parametrize("reset_history", [False, True])
+def test_pic_gdn_compute_only_uses_all_request_state_indices(monkeypatch, reset_history) -> None:
     """No persistent slot is needed for an uncached miss, including short rows."""
-    config = HypicConfig(chunk_size=2, seam_sink_tokens=1)
+    config = HypicConfig(chunk_size=2, seam_sink_tokens=1, reset_conv_history=reset_history)
     plans, step = PicCatalog(1).prepare(
         {
             "first": build_plan([1, 2, 3], {}, config),
@@ -467,3 +505,76 @@ def test_pic_gdn_compute_only_uses_all_request_state_indices(monkeypatch) -> Non
     torch.testing.assert_close(layer.kv_cache[0][7], raw[5:6])
     assert layer.kv_cache[1][3].abs().sum() > 0
     assert layer.kv_cache[1][7].abs().sum() > 0
+
+
+@pytest.mark.parametrize("reset_history", [False, True])
+@pytest.mark.parametrize("seam", [0, 1])
+@pytest.mark.parametrize("cache_mode", ["cold", "mixed", "warm"])
+def test_pic_gdn_conv_history_boundaries(monkeypatch, reset_history, seam, cache_mode) -> None:
+    """Exercise real convolution, cache tails and decode handoff without an NPU kernel."""
+    config = HypicConfig(chunk_size=4, seam_sink_tokens=seam, reset_conv_history=reset_history)
+    tokens = [1, 2, 3, 4, 5, 6]
+    boundaries = [0, 2, 5, 6]
+    cold = build_plan(tokens, {}, config, segment_boundaries=boundaries)
+    ready = {
+        segment["hash"]: tuple(segment["token_ids"])
+        for index, segment in enumerate(cold["segments"][:-1])
+        if cache_mode == "warm" or (cache_mode == "mixed" and index == 1)
+    }
+    plan = build_plan(tokens, ready, config, segment_boundaries=boundaries)
+    validate_plan(plan)
+    slots = {segment["hash"]: index for index, segment in enumerate(plan["segments"][:-1])}
+    context = HypicBatchContext({"request": plan}, ("request",), SimpleNamespace(lookup=slots.get))
+    # Kernel width 4 also exercises segments shorter than the history window.
+    conv_pool = torch.arange(36, dtype=torch.float32).reshape(2, 3, 6) + 100
+    saved_pool = conv_pool.clone()
+    layer = SimpleNamespace(
+        prefix="gdn",
+        conv1d=SimpleNamespace(weight=torch.ones((6, 1, 4)), bias=None),
+        activation=None,
+        hypic_conv_pool=conv_pool,
+        hypic_zero_state_pool=torch.zeros((2, 1, 2, 2)),
+        hypic_transition_pool=torch.eye(2).reshape(1, 1, 2, 2).repeat(2, 1, 1, 1),
+        kv_cache=(torch.full((1, 3, 6), -1.0), torch.zeros((1, 1, 2, 2))),
+        A_log=torch.zeros(1),
+        dt_bias=torch.zeros(1),
+        rearrange_mixed_qkv=lambda raw: tuple(part.reshape(1, -1, 1, 2) for part in raw.chunk(3, dim=-1)),
+    )
+    monkeypatch.setattr("vllm_ascend.hypic.gdn.DeviceOperator.fused_gdn_gating", lambda log, a, b, bias: (a, b))
+    monkeypatch.setattr("vllm_ascend.hypic.gdn._run_gdn", lambda layer, q, k, v, g, beta, initial, cu: (q, initial))
+    raw = torch.tensor(tokens, dtype=torch.float32)[:, None].repeat(1, 6)
+    packed_raw = raw[plan["query_positions"]]
+    output = torch.empty((len(packed_raw), 1, 2))
+    metadata = SimpleNamespace(num_actual_tokens=len(packed_raw), non_spec_state_indices_tensor=torch.tensor([0]))
+    forward_hypic_gdn(
+        layer,
+        packed_raw,
+        torch.zeros((len(packed_raw), 1)),
+        torch.zeros((len(packed_raw), 1)),
+        output,
+        context,
+        metadata,
+    )
+
+    expected_outputs = []
+    history = torch.zeros((3, 6))
+    for index, segment in enumerate(plan["segments"]):
+        if reset_history:
+            history = torch.zeros_like(history)
+        start, end = segment["start"], segment["end"]
+        count = segment["seam"] if segment["hit"] else end - start
+        combined = torch.cat((history, raw[start : start + count]))
+        expected_outputs.extend(combined[offset : offset + 4, :2].sum(0) for offset in range(count))
+        if segment["hit"]:
+            # Resetting a successor must not mutate a hit's cached tail.
+            torch.testing.assert_close(conv_pool[index], saved_pool[index])
+            history = saved_pool[index]
+        else:
+            history = combined[-3:]
+            if segment["cacheable"]:
+                torch.testing.assert_close(conv_pool[index], history)
+    torch.testing.assert_close(output[:, 0], torch.stack(expected_outputs))
+    # The final Query tail survives for native decode, even with reset enabled.
+    torch.testing.assert_close(layer.kv_cache[0][0], history)
+    if reset_history:
+        torch.testing.assert_close(history, torch.cat((torch.zeros((2, 6)), raw[-1:])))

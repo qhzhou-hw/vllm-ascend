@@ -210,6 +210,7 @@ def forward_hypic_attention(
         plan = context.plans.get(request_id)
         if plan is None:
             continue
+        block_native_pic = plan.get("mode") == "block_native_pic"
         prefix_keys: list[torch.Tensor] = []
         prefix_values: list[torch.Tensor] = []
         for segment in plan["segments"]:
@@ -258,8 +259,14 @@ def forward_hypic_attention(
             else:
                 segment_key = current_key
                 segment_value = current_value
-                attention_key = torch.cat(prefix_keys + [segment_key])
-                attention_value = torch.cat(prefix_values + [segment_value])
+                if block_native_pic and end != int(plan["num_tokens"]):
+                    # Training documents see only their own causal block.
+                    # Query and native decode retain access to all document KV.
+                    attention_key = segment_key
+                    attention_value = segment_value
+                else:
+                    attention_key = torch.cat(prefix_keys + [segment_key])
+                    attention_value = torch.cat(prefix_values + [segment_value])
                 if segment.get("store", segment["cacheable"]):
                     absolute_positions = torch.arange(start, end, device=key.device)
                     local_positions = torch.arange(length, device=key.device)

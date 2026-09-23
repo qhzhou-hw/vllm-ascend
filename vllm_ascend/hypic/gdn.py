@@ -75,6 +75,7 @@ def _forward_hypic_gdn_request(
 ) -> None:
     """Execute HYPIC S/T composition for one request in a packed batch."""
     plan = context.plans[request_id]
+    block_native_pic = plan.get("mode") == "block_native_pic"
     layer_name = str(layer.prefix)
     conv_pool = getattr(layer, "hypic_conv_pool", None)
     zero_state_pool = getattr(layer, "hypic_zero_state_pool", None)
@@ -87,7 +88,9 @@ def _forward_hypic_gdn_request(
     b = b[:num_tokens]
 
     width = int(layer.conv1d.weight.shape[-1])
-    history = mixed_qkv.new_zeros((width - 1, mixed_qkv.shape[-1]))
+    zero_history = mixed_qkv.new_zeros((width - 1, mixed_qkv.shape[-1]))
+    history = zero_history
+    reset_conv_history = plan.get("reset_conv_history", False)
     transformed_parts: list[torch.Tensor] = []
     a_parts: list[torch.Tensor] = []
     b_parts: list[torch.Tensor] = []
@@ -96,6 +99,11 @@ def _forward_hypic_gdn_request(
     packed_offset = 0
 
     for segment in plan["segments"]:
+        if reset_conv_history:
+            # history may alias a cached tail. Never zero it in place: hits
+            # and other requests still own that cache entry. Reset once per
+            # segment, not between its seam and interior GDN compute units.
+            history = zero_history
         length = int(segment["end"]) - int(segment["start"])
         hit = bool(segment["hit"])
         query_len = int(segment["seam"]) if hit else length
@@ -181,7 +189,7 @@ def _forward_hypic_gdn_request(
         transition_pool[slot].copy_(transitions[unit_index])
 
     accumulated = torch.zeros_like(zero_states[0])
-    replay_initial = torch.empty_like(zero_states)
+    replay_initial = torch.zeros_like(zero_states) if block_native_pic else torch.empty_like(zero_states)
     unit_cursor = 0
     for segment in plan["segments"]:
         hit = bool(segment["hit"])
@@ -205,7 +213,10 @@ def _forward_hypic_gdn_request(
             continue
         number_of_units = 2 if int(segment["recompute_seam"]) else 1
         for _ in range(number_of_units):
-            replay_initial[unit_cursor] = accumulated
+            # Document outputs remain prefix-independent in block-native mode.
+            # Only the final Query consumes the ordered document composition.
+            if not block_native_pic or int(segment["end"]) == int(plan["num_tokens"]):
+                replay_initial[unit_cursor] = accumulated
             accumulated = _compose(
                 accumulated,
                 transitions[unit_cursor],

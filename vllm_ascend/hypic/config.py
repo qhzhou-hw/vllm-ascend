@@ -20,6 +20,8 @@ class HypicConfig:
     # Semantic boundaries may create many short units even in a short prompt.
     max_prefill_units: int = 256
     mode: str = "transition_rope_recompute"
+    # Only affects legacy HYPIC. block_native_pic always resets convolution.
+    reset_conv_history: bool = False
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any] | None) -> HypicConfig:
@@ -35,8 +37,12 @@ class HypicConfig:
 
     def validate(self) -> None:
         """Reject settings outside the implemented algorithm contract."""
-        if self.mode != "transition_rope_recompute":
-            raise ValueError("vllm-ascend HYPIC currently supports only mode='transition_rope_recompute'")
+        if not isinstance(self.reset_conv_history, bool):
+            raise ValueError("hypic_config.reset_conv_history must be a boolean")
+        if self.mode not in {"transition_rope_recompute", "block_native_pic"}:
+            raise ValueError("HYPIC supports only mode='transition_rope_recompute' or 'block_native_pic'")
+        if self.mode == "block_native_pic" and self.seam_sink_tokens != 0:
+            raise ValueError("hypic_config mode='block_native_pic' requires seam_sink_tokens=0")
         if self.chunk_size <= 0:
             raise ValueError("hypic_config.chunk_size must be positive")
         if self.seam_sink_tokens < 0:

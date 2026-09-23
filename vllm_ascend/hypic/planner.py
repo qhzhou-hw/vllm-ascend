@@ -64,12 +64,30 @@ def build_plan(
 ) -> dict[str, Any]:
     """Build a process-safe sparse prefill plan for one request.
 
-    The final segment always executes to produce logits. A cache hit on the
-    first segment executes no queries; later hits execute the seam sink at the
-    segment start so boundary behavior matches the SGLang implementation.
+    Query always executes. Legacy HYPIC recomputes hit seams; block-native PIC
+    uses explicit training boundaries and skips every hit document completely.
     """
     tokens = [int(token) for token in token_ids]
-    ranges = split_segments(len(tokens), config.chunk_size, boundaries=segment_boundaries)
+    block_native_pic = config.mode == "block_native_pic"
+    if block_native_pic:
+        config.validate()
+        if segment_boundaries is None:
+            raise ValueError("block_native_pic requires explicit hypic_segment_boundaries matching training")
+        boundaries = list(segment_boundaries)
+        if any(isinstance(position, bool) or not isinstance(position, int) for position in boundaries):
+            raise ValueError("block_native_pic boundaries must be integer token offsets")
+        if len(boundaries) < 3 or boundaries[0] != 0 or boundaries[-1] != len(tokens):
+            raise ValueError("block_native_pic boundaries must include 0, document/query boundary, and prompt length")
+        # A storage limit must never introduce extra reset/attention boundaries.
+        # Query has no persistent segment slot and may exceed chunk_size.
+        ranges = split_segments(len(tokens), max(len(tokens), 1), boundaries=boundaries)
+        if any(end - start > config.chunk_size for start, end in ranges[:-1]):
+            raise ValueError(
+                "block_native_pic document exceeds chunk_size; increase the pool slot size, do not split it"
+            )
+    else:
+        ranges = split_segments(len(tokens), config.chunk_size, boundaries=segment_boundaries)
+    reset_conv_history = config.reset_conv_history or block_native_pic
     query_positions: list[int] = []
     segments: list[dict[str, Any]] = []
 
@@ -79,9 +97,17 @@ def build_plan(
         coverage_start = min(config.seam_sink_tokens, end - start) if index > 0 and not is_last else 0
         content_hash = segment_hash(segment_tokens)
         # Each engine has private pools (model/dtype/TP/RoPE lifetime). Within
-        # that namespace, isolate caller salt and full/interior GDN payloads.
+        # that namespace, isolate caller salt and training-aligned semantics.
         identity = json.dumps(
-            [PIC_PROTOCOL_VERSION, cache_salt, content_hash, len(segment_tokens), coverage_start],
+            [
+                PIC_PROTOCOL_VERSION,
+                config.mode,
+                reset_conv_history,
+                cache_salt,
+                content_hash,
+                len(segment_tokens),
+                coverage_start,
+            ],
             separators=(",", ":"),
             ensure_ascii=True,
         )
@@ -112,6 +138,8 @@ def build_plan(
 
     return {
         "version": PIC_PROTOCOL_VERSION,
+        "mode": config.mode,
+        "reset_conv_history": reset_conv_history,
         "num_tokens": len(tokens),
         "logical_advance": len(tokens),
         "query_positions": query_positions,
@@ -157,6 +185,15 @@ def validate_plan(plan: dict[str, Any]) -> None:
     """Validate plan invariants before a worker trusts scheduler metadata."""
     if plan.get("version") != PIC_PROTOCOL_VERSION:
         raise ValueError(f"Unsupported HYPIC plan version: {plan.get('version')}")
+    if plan.get("mode") not in {"transition_rope_recompute", "block_native_pic"}:
+        raise ValueError("HYPIC plan mode is missing or unsupported")
+    if not isinstance(plan.get("reset_conv_history"), bool):
+        raise ValueError("HYPIC plan reset_conv_history must be a boolean")
+    if plan["mode"] == "block_native_pic":
+        if not plan["reset_conv_history"] or len(plan["segments"]) < 2:
+            raise ValueError("block_native_pic plan requires convolution reset and documents plus query")
+        if any(segment["seam"] or segment["recompute_seam"] for segment in plan["segments"]):
+            raise ValueError("block_native_pic plan cannot recompute seams")
     num_tokens = int(plan["num_tokens"])
     positions = [int(pos) for pos in plan["query_positions"]]
     if positions != sorted(set(positions)):

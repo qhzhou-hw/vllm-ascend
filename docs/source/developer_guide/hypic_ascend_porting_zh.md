@@ -113,6 +113,74 @@ additional_config={
 
 Full Recompute 基线应显式设置 `enable_prefix_caching=False`，不要与 HYPIC engine 复用。
 
+#### 跨 segment 的 Conv history 开关
+
+新增 `additional_config.hypic_config.reset_conv_history`，只接受布尔值，默认 `False`：
+
+| 配置 | segment 起点的卷积 history | tail 缓存 |
+| --- | --- | --- |
+| `False`（默认） | 继承前段 tail；首段从零开始 | 保留，用于后段 miss、hit seam 或 Query |
+| `True` | 每个 segment 均从零开始，包括 Query | 仍保存，不向后段卷积注入 |
+
+tail 是最后 `K-1` 个卷积前的原始 `mixed_qkv` 向量，不是卷积输出或 GDN recurrent
+state。默认行为保持既有 HYPIC 语义；对于希望段间卷积独立、命中段无需重算的实验，
+可以显式组合以下配置：
+
+```python
+additional_config={
+    "hypic_config": {
+        "enabled": True,
+        "chunk_size": 512,
+        "seam_sink_tokens": 0,
+        "reset_conv_history": True,
+        "max_cache_segments": 96,
+    }
+}
+```
+
+两个选项互不隐式修改：零 seam 不代表清零 history；开启清零也不会自动把 seam 改为零。
+若 seam 非零，只在整个 segment 开始处重置，不会在其 seam/interior 的 GDN 计算单元之间
+再次重置。边界以 planner 实际生成的 segment 为准：超长语义段按 `chunk_size` 拆分后，
+各子段也会重置；这与只在工具描述边界重置并不等价。
+
+实现通过可序列化 plan 的 `reset_conv_history` 字段传到 worker。控制协议升级为 v3，
+拒绝旧 plan；缓存键同时包含 mode 和有效 reset 设置，防止不同语义混用。该选项应在 engine 启动时
+设置，切换模式需重启 engine，不复用旧缓存或沿用旧实验分数。
+
+worker 在每段卷积之前选择独立的零 history buffer，不能对 `history` 直接 `zero_()`：
+它可能是 `hypic_conv_pool[slot]` 的视图，会破坏其它请求仍需复用的缓存。两种模式都继续
+保存 tail；最后 Query 的 tail 正常写入 native conv cache，后续 decode 继续读取它，
+不能在每个生成 token 前清零。
+
+**范围限制：本开关仅修改卷积 history，不改变 GDN S/T 组合、Document 的 prefix-seeded
+replay 或 Full Attention 的可见范围。** 因此它还不是 MindSpeed-MM block-native PIC
+训练语义的完整对齐开关，也不能单独保证 Document KV 前缀无关。若要完整对齐，还需要
+独立处理 Document GDN 输出和段间 attention 隔离。现在可通过下面的 `block_native_pic`
+模式一次启用这些语义，原有默认模式仍然保留。
+
+新增单测覆盖配置类型、plan 传递与缓存键隔离、cold/mixed/warm、零/非零 seam、短 segment、
+compute-only miss、多请求状态槽及 Query 到 decode 的 tail 保留。卷积边界测试使用真实
+`conv1d`，GDN NPU kernel 使用替身隔离；这些测试不代替 Ascend 端到端准确率验证。
+
+#### MindSpeed-MM 训练对齐模式
+
+配置 `mode="block_native_pic"`、`seam_sink_tokens=0`。此模式始终清零每段卷积 history，
+Document 的 GDN 输出只用零初始状态，只有 Query 使用顺序组合后的 S/T；Document 的
+Full Attention 只看段内因果前缀，Query 可以看全部 Document 和自身因果前缀。
+
+必须在请求 `SamplingParams.extra_args.hypic_segment_boundaries` 中显式给出训练边界，
+包含 0 和 prompt 总长度，最后一段为 Query，至少一段 Document。与训练一致地先移除
+结构性 separator token，再在最终 token ID 序列上标记边界；推理引擎不会自动移除。
+Document 超过 `chunk_size` 会报错，不能自动细分以免改变训练计算图；可增大 slot 大小。
+Query 无持久化 segment slot，可以超过 `chunk_size`。
+
+该模式下 `hypic_cache_policy="full_recompute"` 保持同样的 block-native 计算图，仅关闭
+PIC 读取和写入，用于对照 `pic` 的 cold/warm 输出。不能用关闭 HYPIC 的普通全因果模型
+作为等价计算基线。`prefix_only` 和被抢占后的 native replay 当前明确拒绝，避免静默回退。
+
+完整设计、配置和验证方法见 [训练对齐说明](hypic_block_native_alignment_zh.md)。
+新增代码尚未完成 Ascend 实机准确率验证；旧 LongBench/MCPAgentBench 分数不适用于此模式。
+
 ### 3.3 在 scheduler 侧建立可序列化 plan
 
 planner 对 token ID 执行以下步骤：
@@ -338,13 +406,19 @@ HYPIC-1024 `43.58`；对应 SGLang Ascend B4 分别为 `43.50`、`43.73`、`43.5
 
 ### 6.6 prefix caching 的开关语义不同
 
-HYPIC 模式内部保留 vLLM prefix caching 配置以通过 hybrid-cache 校验，但标准 computed-block hit 已被 HYPIC planner 接管。Full Recompute 基线则必须关闭 prefix caching。
+HYPIC 模式内部保留 vLLM prefix caching 配置以通过 hybrid-cache 校验，但标准 computed-block hit 已被 HYPIC planner 接管。
+使用当前请求策略接口时，`full_recompute` 禁用缓存命中与发布；不要混淆 engine 配置开关和请求级缓存策略。
+特别是 `block_native_pic` 的基线必须保留该 mode 和 HYPIC 启用状态，只将请求策略设为
+`full_recompute`，否则会变成不同的普通 causal 计算图。详见[训练对齐说明](hypic_block_native_alignment_zh.md)。
 
 ### 6.7 静态 segment pool 必须纳入显存预算
 
 HYPIC public KV、conv tail 和 GDN `S/T` 在模型构造阶段预分配，vLLM 会把它们计入模型占用，再依据 `gpu_memory_utilization` 缩放普通 KV cache。Qwen3.5-35B-A3B、TP=2、96 slots 的实测模型占用为每卡约 39.01 GiB；`gpu_memory_utilization=0.85` 时 vLLM 自动留下约 8.19 GiB 普通 KV cache，并在 profile 中记录约 4.15 GiB peak activation。
 
-增大 `max_cache_segments` 会线性扩大模型 buffer，减小普通 KV cache；减小它又必须满足当前 batch token budget 的最低 slot 数。调参时应同时验证 engine profile、最长 prompt、batch=4 峰值和 warm hit，不能只观察启动后的空闲显存。
+增大 `max_cache_segments` 会线性扩大模型 buffer，减小普通 KV cache。当前调度器保护已接纳 hit 的槽位；
+新 miss 无空闲持久槽时走 compute-only，不再要求能够同时保存当前 batch 的全部 segment。
+但 GDN 临时 workspace 仍受 token budget 和 `max_prefill_units` 影响。
+调参时应同时验证 engine profile、最长 prompt、batch=4 峰值和 warm hit，不能只观察启动后的空闲显存。
 
 ### 6.8 Batch 中每个请求必须独立维护 HYPIC 状态
 
@@ -368,6 +442,9 @@ block-table row、GDN decode state slot 和 segment plan。一次 forward 的 pl
 现有 offline LongBench runner 的 `cached_tokens` 字段填 0，并未从 HYPIC plan 汇总真实命中 token。准确率可以使用该 runner；若要报告命中率或性能收益，应另加 scheduler plan 统计，不能直接使用该字段。
 
 ### 6.11 零 seam 是支持的激进配置，不是已验证默认值
+
+本节针对旧 `transition_rope_recompute` 模式；训练对齐的 `block_native_pic` 必须使用 seam=0，
+不能套用下面的 seam=8 建议。两种模式的验证结论应分别报告。
 
 `seam_sink_tokens=0` 不等于关闭 HYPIC，也不会强制跳过未缓存的 segment。它只让已经
 命中的非末段 segment 完全不重算。此时 planner 不为命中段加入 `query_positions`，

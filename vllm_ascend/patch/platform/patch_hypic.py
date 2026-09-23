@@ -91,9 +91,11 @@ def _check_and_update_config(cls: type, vllm_config: Any) -> None:
         # APC lookup and publication; prefix_only requests retain native APC.
         vllm_config.cache_config.mamba_cache_mode = "align"
         logger.info(
-            "Enabled HYPIC transition_rope_recompute with chunk_size=%d, seam=%d",
+            "Enabled HYPIC mode=%s with chunk_size=%d, seam=%d, reset_conv_history=%s",
+            config.mode,
             config.chunk_size,
             config.seam_sink_tokens,
+            config.reset_conv_history or config.mode == "block_native_pic",
         )
 
 
@@ -112,7 +114,7 @@ def _scheduler_init(self: Scheduler, *args: Any, **kwargs: Any) -> None:
         original_cache_blocks = coordinator.cache_blocks
 
         def cache_blocks(request: Any, num_computed_tokens: int) -> None:
-            if request_policy(request) == "prefix_only":
+            if config.mode != "block_native_pic" and request_policy(request) == "prefix_only":
                 original_cache_blocks(request, num_computed_tokens)
 
         coordinator.cache_blocks = cache_blocks
@@ -180,7 +182,10 @@ def _allocate_slots(self: KVCacheManager, request: Any, *args: Any, **kwargs: An
     policy = request_policy(request)
     # A preempted request replays its full prompt + generated tokens through
     # native execution. It retains PIC publication isolation but no old lease.
-    kind = "pic" if policy == "pic" and not request.num_preemptions else "native"
+    block_native = scheduler.hypic_config.mode == "block_native_pic"
+    if block_native and (request.num_preemptions or policy == "prefix_only"):
+        raise ValueError("block_native_pic cannot fall back to native prefix/preemption replay")
+    kind = "pic" if (policy == "pic" or block_native) and not request.num_preemptions else "native"
     active_kind = scheduler.hypic_batch_kind
     if active_kind is not None and active_kind != kind:
         return None
@@ -205,7 +210,11 @@ def _mamba_block_aligned_split(
     num_new_local_computed_tokens: int = 0,
     num_external_computed_tokens: int = 0,
 ) -> int:
-    if hasattr(self, "hypic_catalog") and request_policy(request) == "pic" and not request.num_preemptions:
+    if (
+        hasattr(self, "hypic_catalog")
+        and (request_policy(request) == "pic" or self.hypic_config.mode == "block_native_pic")
+        and not request.num_preemptions
+    ):
         return num_new_tokens
     return _ORIGINAL_MAMBA_SPLIT(
         self,
@@ -222,9 +231,12 @@ def _get_computed_blocks(self: KVCacheManager, request: Any) -> tuple[Any, int, 
         return _ORIGINAL_GET_COMPUTED_BLOCKS(self, request)
     request.hypic_plan = None
     policy = request_policy(request)
+    block_native = scheduler.hypic_config.mode == "block_native_pic"
+    if block_native and (request.num_preemptions or policy == "prefix_only"):
+        raise ValueError("block_native_pic cannot fall back to native prefix/preemption replay")
     if policy == "prefix_only":
         return _ORIGINAL_GET_COMPUTED_BLOCKS(self, request)
-    if policy == "full_recompute" or request.num_preemptions:
+    if (policy == "full_recompute" and not block_native) or request.num_preemptions:
         return self.empty_kv_cache_blocks, 0, 0
     if request.prompt_token_ids is None:
         raise ValueError("HYPIC requires token-id prompts")
@@ -243,11 +255,16 @@ def _get_computed_blocks(self: KVCacheManager, request: Any) -> tuple[Any, int, 
     segment_boundaries = extra_args.get("hypic_segment_boundaries")
     plan = build_plan(
         request.prompt_token_ids,
-        scheduler.hypic_catalog.ready,
+        {} if policy == "full_recompute" else scheduler.hypic_catalog.ready,
         scheduler.hypic_config,
         segment_boundaries=segment_boundaries,
         cache_salt=getattr(request, "cache_salt", None),
     )
+    if block_native and policy == "full_recompute":
+        # The baseline must keep the training computation graph, not revert
+        # to ordinary causal attention. Disable PIC reads AND publication.
+        for segment in plan["segments"]:
+            segment["cacheable"] = False
     if plan["num_prefill_units"] > scheduler.hypic_config.max_prefill_units:
         raise ValueError(
             f"PIC prompt needs {plan['num_prefill_units']} GDN units, exceeding "

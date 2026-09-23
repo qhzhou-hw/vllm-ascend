@@ -218,6 +218,55 @@ class PicAdapterTests(unittest.TestCase):
                 hooks._get_computed_blocks(self.manager, self.request("prefix_only")), ("prefix-blocks", 8, 0)
             )
 
+    def test_block_native_full_recompute_preserves_graph_without_cache_reads_or_writes(self):
+        self.scheduler.hypic_config = replace(self.config, mode="block_native_pic", seam_sink_tokens=0)
+        req = self.request("full_recompute")
+        boundaries = [0, 4, 8, 12, 13]
+        req.sampling_params.extra_args["hypic_segment_boundaries"] = boundaries
+        cold = build_plan(
+            req.prompt_token_ids,
+            {},
+            self.scheduler.hypic_config,
+            segment_boundaries=boundaries,
+            cache_salt=req.cache_salt,
+        )
+        _, step = self.catalog.prepare({"warmup": cold})
+        self.catalog.commit(
+            PicAcknowledgement(step.epoch, step.step_id, tuple(f.target for f in step.fills), 2), expected_ranks=2
+        )
+        self.assertEqual(hooks._get_computed_blocks(self.manager, req), ((), 0, 0))
+        self.assertEqual(req.hypic_plan["mode"], "block_native_pic")
+        self.assertEqual(req.hypic_plan["query_positions"], list(range(13)))
+        self.assertTrue(req.hypic_plan["reset_conv_history"])
+        self.assertFalse(any(s["hit"] or s["cacheable"] for s in req.hypic_plan["segments"]))
+        _, step = self.catalog.prepare({"baseline": req.hypic_plan})
+        self.assertEqual((step.reads, step.fills), ((), ()))
+
+    def test_block_native_rejects_graph_changing_fallbacks(self):
+        self.scheduler.hypic_config = replace(self.config, mode="block_native_pic", seam_sink_tokens=0)
+        for policy, preemptions in (("prefix_only", 0), ("pic", 1), ("full_recompute", 1)):
+            req = self.request(policy)
+            req.num_preemptions = preemptions
+            with self.assertRaisesRegex(ValueError, "cannot fall back"):
+                hooks._get_computed_blocks(self.manager, req)
+            with self.assertRaisesRegex(ValueError, "cannot fall back"):
+                hooks._allocate_slots(self.manager, req, 13)
+
+    def test_block_native_full_recompute_is_atomic_and_pic_batch_compatible(self):
+        self.scheduler.hypic_config = replace(self.config, mode="block_native_pic", seam_sink_tokens=0)
+        req = self.request("full_recompute")
+        self.assertEqual(hooks._mamba_block_aligned_split(self.scheduler, req, 13), 13)
+        self.scheduler.hypic_batch_kind = "pic"
+
+        def allocate(manager, request, num_new_tokens, delay_cache_blocks=False):
+            return (num_new_tokens, delay_cache_blocks)
+
+        with (
+            patch.object(hooks, "_ORIGINAL_ALLOCATE_SLOTS", allocate, create=True),
+            patch.object(hooks, "_ALLOCATE_SIGNATURE", inspect.signature(allocate), create=True),
+        ):
+            self.assertEqual(hooks._allocate_slots(self.manager, req, 13), (13, True))
+
     def test_publication_guard_protects_decode_and_direct_coordinator_calls(self):
         native_publish = Mock()
         coordinator = SimpleNamespace(cache_blocks=native_publish)

@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-PIC_PROTOCOL_VERSION = 2
+# Version 3 identifies graph mode and convolution semantics in plans/cache keys.
+PIC_PROTOCOL_VERSION = 3
 
 
 @dataclass(frozen=True)

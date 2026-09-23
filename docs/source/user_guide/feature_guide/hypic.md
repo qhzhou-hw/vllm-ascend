@@ -78,6 +78,104 @@ MCPAgentBench accuracy results used the default value of `8`. Use `0` only
 after checking accuracy for the target workload; it may amplify approximation
 error around segment boundaries.
 
+### Segment convolution history in legacy HYPIC
+
+`reset_conv_history` is a boolean under `hypic_config`, defaulting to `False`.
+The default preserves HYPIC's existing behavior: the preceding segment's last
+`K-1` raw, pre-convolution QKV vectors initialize the next segment's convolution
+(including a cache-hit seam, a miss, or the final Query). Cached tails remain
+available even when their source segment is skipped on a cache hit.
+
+Set it to `True` to start convolution with zero history at each planned segment
+boundary. For a workload that does not recompute hit seams, configure both
+options explicitly:
+
+```python
+additional_config={
+    "hypic_config": {
+        "enabled": True,
+        "chunk_size": 512,
+        "seam_sink_tokens": 0,
+        "reset_conv_history": True,
+        "max_cache_segments": 96,
+    }
+}
+```
+
+These options are independent: `seam_sink_tokens=0` alone does not reset history;
+`reset_conv_history=True` alone does not disable seam recomputation. With a
+nonzero seam, reset happens once at the segment start, not between its seam and
+interior. Every segment produced by the planner resets, including subdivisions
+of a semantic region longer than `chunk_size` and the final Query.
+This switch applies to the HYPIC segmented execution path. In legacy mode,
+`hypic_cache_policy="full_recompute"` still uses native causal inference and
+does not apply the segment convolution reset.
+
+Tail caching is retained in both modes. Reset uses a separate zero buffer and
+does not erase another segment's cached tail. The final Query's resulting tail
+still initializes native autoregressive decode; this is not a per-token reset.
+The reset mode is carried in scheduler plans and isolated in segment cache keys.
+Treat it as an engine-startup setting and restart the engine to change modes.
+
+This flag changes **convolution only**. GDN S/T composition, prefix-seeded replay
+for computed document tokens, and the existing attention visibility are
+unchanged. It is not a complete block-native PIC training/inference alignment
+switch and does not by itself make document KV prefix-independent. Use the
+`block_native_pic` mode below for training-aligned graph semantics. Existing
+accuracy results do not validate reset mode; Ascend end-to-end validation is
+still required.
+
+### MindSpeed-MM block-native PIC mode
+
+The default `mode="transition_rope_recompute"` retains the original HYPIC
+algorithm. To match MindSpeed-MM's block-native PIC training graph, select:
+
+```python
+additional_config={
+    "hypic_config": {
+        "enabled": True,
+        "mode": "block_native_pic",
+        "chunk_size": 512,
+        "seam_sink_tokens": 0,
+        "max_cache_segments": 96,
+    }
+}
+```
+
+In this mode, convolution resets at every segment, including Query, regardless
+of `reset_conv_history`. Document GDN outputs start from zero state; their S/T
+summaries are composed in request order only to initialize Query. Document
+attention is causal within each document; Query attention sees all preceding
+documents plus its own causal prefix. Native decode continues Query's conv/GDN
+state and reads the materialized document and Query KV cache.
+
+Every request must supply `hypic_segment_boundaries` in `SamplingParams.extra_args`:
+integer token offsets `[0, doc1_end, doc2_end, ..., prompt_length]`. The last
+region is Query (including the assistant generation prefix); at least one
+Document and a nonempty Query are required. Match the training token stream,
+chat template and boundaries exactly. Remove structural PIC separator token
+IDs just as the training preprocessing does, then compute offsets on the
+remaining IDs. The engine does not strip separators or infer training regions.
+
+Nonzero seam is rejected. Unlike legacy HYPIC, documents are never automatically
+subdivided by `chunk_size`: an oversized document fails with an instruction to
+increase the slot size. Query is not cached as a document and may be longer
+than `chunk_size`. This prevents storage sizing from changing training semantics.
+
+`hypic_cache_policy="full_recompute"` in this mode executes the **same block-native
+graph**, but does not read or populate PIC entries. Use it as the cold baseline
+against `hypic_cache_policy="pic"`; disabling HYPIC entirely would instead run
+ordinary causal inference and is not an equivalent baseline. `prefix_only`
+and preemption replay are rejected rather than silently changing the graph.
+
+Cache keys include mode and effective convolution-reset behavior. Protocol v3
+rejects older control plans; restart all engine workers on upgrade and warm
+fresh caches. This implements graph alignment, not a claim of bitwise numerical
+parity across kernels/devices. Ascend random-weight operator tests passed for
+64/129/512-token documents and GDN batches 1/4, including cold/warm reuse.
+Full-engine and model-level accuracy validation remain pending.
+See the [training-alignment notes](../../developer_guide/hypic_block_native_alignment_zh.md).
+
 `max_cache_segments` sizes fixed model-owned attention and GDN state pools.
 vLLM accounts for these buffers before sizing its ordinary KV cache. Admitted
 hits keep their slots for the whole forward. If the pool cannot store all new
@@ -115,13 +213,14 @@ params = SamplingParams(
 ```
 
 The boundary offsets above are illustrative and must match the actual input.
-Each semantic region is split further when longer than `chunk_size`.
+In the default legacy mode, each semantic region is split further when longer
+than `chunk_size`. Block-native mode uses the stricter boundary contract above.
 
-| Policy | Behavior with HYPIC enabled |
-| --- | --- |
-| `pic` (default) | Segment reuse; ordinary APC lookup and publication disabled |
-| `prefix_only` | Native inference and ordinary exact prefix caching |
-| `full_recompute` | Native inference with neither PIC nor APC reuse/publication |
+| Policy | Legacy HYPIC | Block-native PIC |
+| --- | --- | --- |
+| `pic` (default) | Segment reuse; ordinary APC disabled | Independent document reuse; ordinary APC disabled |
+| `prefix_only` | Native inference and ordinary exact prefix caching | Rejected |
+| `full_recompute` | Native inference without PIC/APC reuse | Block-native graph without PIC/APC reuse/publication |
 
 The scheduler separates PIC and native prefill batches. PIC results never
 enter the ordinary APC namespace, including subsequent decode blocks. Native
