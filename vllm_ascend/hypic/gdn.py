@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Any
+from collections import OrderedDict
+from dataclasses import dataclass
+from itertools import accumulate
+from typing import Any, cast
 
 import torch
 import torch.nn.functional as F
@@ -13,7 +16,28 @@ except ImportError:  # Optional until HYPIC is enabled.
     chunk_gated_delta_rule_npu = None
 
 from vllm_ascend.device.device_op import DeviceOperator
+from vllm_ascend.hypic.compose import ComposeStep, build_compose_steps, compose_fused_batch, compose_reference
 from vllm_ascend.hypic.runtime import HypicBatchContext
+
+_CU_CACHE_SIZE = 8
+
+
+def _cu_seqlens(layer: Any, lengths: list[int], device: torch.device) -> torch.Tensor:
+    """Bounded, device-qualified cache of immutable layout metadata, not state.
+
+    sgl-kernel-npu caches derived chunk indices by tensor identity. Retain the
+    exact tensor for repeated layouts so S/T/Query do not repeat CPU-NPU syncs.
+    """
+    cache = getattr(layer, "_hypic_gdn_cu_cache", None)
+    if cache is None:
+        cache = layer._hypic_gdn_cu_cache = OrderedDict()
+    key = (device, tuple(lengths))
+    if key not in cache:
+        cache[key] = torch.tensor([0, *accumulate(lengths)], dtype=torch.int32, device=device)
+        if len(cache) > _CU_CACHE_SIZE:
+            cache.popitem(last=False)
+    cache.move_to_end(key)
+    return cache[key]
 
 
 def _causal_conv(layer: Any, raw: torch.Tensor, history: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -58,8 +82,69 @@ def _run_gdn(
     return output, final_state.transpose(-1, -2).contiguous()
 
 
-def _compose(state: torch.Tensor, transition: torch.Tensor, zero_state: torch.Tensor) -> torch.Tensor:
-    return torch.bmm(state.float(), transition.float()) + zero_state.float()
+@dataclass
+class _PendingGdn:
+    """Keep only one bounded group's inputs alive until the fused state update."""
+
+    q: torch.Tensor
+    k: torch.Tensor
+    v: torch.Tensor
+    g: torch.Tensor
+    beta: torch.Tensor
+    cu_seqlens: torch.Tensor
+    zero_states: torch.Tensor | None
+    transitions: torch.Tensor | None
+    history: torch.Tensor
+    output: torch.Tensor
+    request_index: int
+    steps: tuple[ComposeStep, ...]
+    summarizes_query: bool
+
+
+def _finish_request(
+    layer: Any, work: _PendingGdn, replay: torch.Tensor, document_state: torch.Tensor, attn_metadata: Any
+) -> None:
+    """Replay fresh units, or execute Query once for the cache-only fast path."""
+    state_indices = getattr(attn_metadata, "non_spec_state_indices_tensor", None)
+    if state_indices is None:
+        state_indices = attn_metadata.prefill_state_indices
+    if state_indices is None or work.request_index >= len(state_indices):
+        raise RuntimeError(f"HYPIC GDN state metadata is missing request {work.request_index}")
+    initial = replay if work.summarizes_query else document_state.unsqueeze(0)
+    output, final = _run_gdn(
+        layer,
+        work.q,
+        work.k,
+        work.v,
+        work.g,
+        work.beta,
+        initial,
+        work.cu_seqlens,
+    )
+    work.output.copy_(output.squeeze(0))
+    state_index = state_indices[work.request_index].to(torch.long)
+    final_state = document_state if work.summarizes_query else final[-1]
+    layer.kv_cache[1][state_index] = final_state.to(layer.kv_cache[1].dtype)
+    layer.kv_cache[0][state_index] = work.history.to(layer.kv_cache[0].dtype)
+
+
+def _finish_fused_group(layer: Any, pending: list[_PendingGdn], attn_metadata: Any) -> None:
+    """Compose ordered summaries across requests/heads, then replay outputs."""
+    if not pending or any(work.zero_states is None or work.transitions is None for work in pending):
+        raise RuntimeError("HYPIC fused composition requires an unconsumed nonempty group")
+    replay_states, final_states = compose_fused_batch(
+        [cast(torch.Tensor, work.zero_states) for work in pending],
+        [cast(torch.Tensor, work.transitions) for work in pending],
+        layer.hypic_zero_state_pool,
+        layer.hypic_transition_pool,
+        [work.steps for work in pending],
+    )
+    # Drop all fresh S/T workspaces before replay, as in the reference path.
+    for work in pending:
+        work.zero_states = None
+        work.transitions = None
+    for row, (work, replay) in enumerate(zip(pending, replay_states)):
+        _finish_request(layer, work, replay, final_states[row], attn_metadata)
 
 
 def _forward_hypic_gdn_request(
@@ -72,9 +157,13 @@ def _forward_hypic_gdn_request(
     attn_metadata: Any,
     request_id: str,
     request_index: int,
+    pending: list[_PendingGdn] | None = None,
 ) -> None:
     """Execute HYPIC S/T composition for one request in a packed batch."""
     plan = context.plans[request_id]
+    query = plan["segments"][-1]
+    if query["hit"] or query["cacheable"] or query["recompute_seam"]:
+        raise RuntimeError("HYPIC GDN requires a final uncached, unsplit Query")
     block_native_pic = plan.get("mode") == "block_native_pic"
     layer_name = str(layer.prefix)
     conv_pool = getattr(layer, "hypic_conv_pool", None)
@@ -160,90 +249,62 @@ def _forward_hypic_gdn_request(
     # workspaces for long prompts.
     del transformed, transformed_parts, a_parts, b_parts, joined_a, joined_b
     lengths = [int(unit["length"]) for unit in units]
-    cu_seqlens = torch.tensor(
-        [0, *torch.tensor(lengths).cumsum(0).tolist()],
-        dtype=torch.int32,
-        device=q.device,
-    )
-    num_units = len(units)
+    cu_seqlens = _cu_seqlens(layer, lengths, q.device)
+    # Splitting fresh Document/Query passes regressed real-NPU latency due to
+    # extra varlen metadata processing. Keep the original packed path there.
+    # Without fresh Documents/seams, Query alone needs no affine summary.
+    summarizes_query = len(units) > 1
+    num_units = len(units) if summarizes_query else 0
     num_heads = v.shape[2]
     value_dim = v.shape[-1]
     key_dim = k.shape[-1]
-    zero = torch.zeros(
-        (num_units, num_heads, value_dim, key_dim),
-        dtype=torch.float32,
-        device=q.device,
-    )
-    _, zero_states = _run_gdn(layer, q, k, v, g, beta, zero, cu_seqlens)
-    identity = torch.zeros_like(zero)
-    identity.diagonal(dim1=-2, dim2=-1).fill_(1)
-    del zero
-    v_zero = v.new_zeros((1, v.shape[1], num_heads, key_dim))
-    _, transitions = _run_gdn(layer, q, k, v_zero, g, beta, identity, cu_seqlens)
-    del identity, v_zero
-    zero_states = zero_states.float()
-    transitions = transitions.float()
+    if num_units:
+        zero = torch.zeros((num_units, num_heads, value_dim, key_dim), dtype=torch.float32, device=q.device)
+        zero_output, zero_states = _run_gdn(layer, q, k, v, g, beta, zero, cu_seqlens)
+        del zero_output, zero
+        identity = torch.zeros((num_units, num_heads, key_dim, key_dim), dtype=torch.float32, device=q.device)
+        identity.diagonal(dim1=-2, dim2=-1).fill_(1)
+        v_zero = v.new_zeros((1, v.shape[1], num_heads, key_dim))
+        transition_output, transitions = _run_gdn(layer, q, k, v_zero, g, beta, identity, cu_seqlens)
+        del transition_output, identity, v_zero
+        zero_states = zero_states.float()
+        transitions = transitions.float()
+    else:
+        # Fully cached Documents (or a Query-only plan): no S/T GDN calls.
+        zero_states = torch.empty((0, num_heads, value_dim, key_dim), dtype=torch.float32, device=q.device)
+        transitions = zero_states.new_empty((0, num_heads, key_dim, key_dim))
 
     for _, unit_index, slot in cache_writes:
         zero_state_pool[slot].copy_(zero_states[unit_index])
         transition_pool[slot].copy_(transitions[unit_index])
 
-    accumulated = torch.zeros_like(zero_states[0])
-    replay_initial = torch.zeros_like(zero_states) if block_native_pic else torch.empty_like(zero_states)
-    unit_cursor = 0
-    for segment in plan["segments"]:
-        hit = bool(segment["hit"])
-        if hit and int(segment["seam"]):
-            replay_initial[unit_cursor] = accumulated
-            accumulated = _compose(
-                accumulated,
-                transitions[unit_cursor],
-                zero_states[unit_cursor],
-            )
-            unit_cursor += 1
-        if hit:
-            slot = context.cache.lookup(segment["hash"])
-            if slot is None:
-                raise RuntimeError(f"HYPIC GDN slot disappeared for segment {segment['hash']} at {layer_name}")
-            accumulated = _compose(
-                accumulated,
-                transition_pool[slot],
-                zero_state_pool[slot],
-            )
-            continue
-        number_of_units = 2 if int(segment["recompute_seam"]) else 1
-        for _ in range(number_of_units):
-            # Document outputs remain prefix-independent in block-native mode.
-            # Only the final Query consumes the ordered document composition.
-            if not block_native_pic or int(segment["end"]) == int(plan["num_tokens"]):
-                replay_initial[unit_cursor] = accumulated
-            accumulated = _compose(
-                accumulated,
-                transitions[unit_cursor],
-                zero_states[unit_cursor],
-            )
-            unit_cursor += 1
-
-    # Native metadata may classify a one-query sparse prefill as a decode.
-    # The non-spec indices cover *all* request rows, including those short
-    # prefills; prefill_state_indices alone drops such rows.
-    state_indices = getattr(attn_metadata, "non_spec_state_indices_tensor", None)
-    if state_indices is None:
-        state_indices = attn_metadata.prefill_state_indices
-    if state_indices is None or request_index >= len(state_indices):
-        raise RuntimeError(f"HYPIC GDN state metadata is missing request {request_index}")
-    state_index = state_indices[request_index].to(torch.long)
-    layer.kv_cache[1][state_index] = accumulated.to(layer.kv_cache[1].dtype)
-    layer.kv_cache[0][state_index] = history.to(layer.kv_cache[0].dtype)
-
-    # Seeded replay only consumes q/k/v/g/beta and replay_initial. Release the
-    # two per-segment FP32 result sets before entering the third GDN pass so the
-    # kernel workspace can reuse their allocator blocks instead of pushing the
-    # NPU to its memory limit.
-    del zero_states, transitions, cache_writes, accumulated
-
-    output, _ = _run_gdn(layer, q, k, v, g, beta, replay_initial, cu_seqlens)
-    core_attn_out[:num_tokens] = output.squeeze(0)
+    steps, expected_units = build_compose_steps(plan, context.cache.lookup, include_query=summarizes_query)
+    if expected_units != num_units:
+        raise RuntimeError("HYPIC composition unit count mismatch")
+    work = _PendingGdn(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        cu_seqlens=cu_seqlens,
+        zero_states=zero_states,
+        transitions=transitions,
+        history=history,
+        output=core_attn_out[:num_tokens],
+        request_index=request_index,
+        steps=steps,
+        summarizes_query=summarizes_query,
+    )
+    if pending is not None:
+        pending.append(work)
+        return
+    replay_initial, document_state = compose_reference(
+        zero_states, transitions, zero_state_pool, transition_pool, steps, zero_replay=block_native_pic
+    )
+    work.zero_states = work.transitions = None
+    del zero_states, transitions, cache_writes
+    _finish_request(layer, work, replay_initial, document_state, attn_metadata)
 
 
 def forward_hypic_gdn(
@@ -256,6 +317,15 @@ def forward_hypic_gdn(
     attn_metadata: Any,
 ) -> None:
     """Execute independent HYPIC state composition for a packed request batch."""
+    backend = getattr(layer, "hypic_state_compose_backend", "torch")
+    if backend not in {"torch", "triton"}:
+        raise ValueError(f"Unsupported HYPIC state composition backend: {backend}")
+    if backend == "triton" and mixed_qkv.device.type != "npu":
+        raise ValueError("HYPIC triton composition requires an NPU")
+    group_size = getattr(layer, "hypic_state_compose_batch_size", 1)
+    if isinstance(group_size, bool) or not isinstance(group_size, int) or group_size <= 0:
+        raise ValueError("HYPIC state composition batch size must be a positive integer")
+    pending: list[_PendingGdn] = []
     packed_offset = 0
     for request_index, request_id in enumerate(context.request_ids):
         plan = context.plans[request_id]
@@ -271,8 +341,16 @@ def forward_hypic_gdn(
             attn_metadata,
             request_id,
             request_index,
+            **({"pending": pending} if backend == "triton" else {}),
         )
         packed_offset = packed_end
+        if pending and len(pending) >= group_size:
+            _finish_fused_group(layer, pending, attn_metadata)
+            pending.clear()
+
+    if pending:
+        _finish_fused_group(layer, pending, attn_metadata)
+        pending.clear()
 
     num_actual_tokens = int(attn_metadata.num_actual_tokens)
     if packed_offset != num_actual_tokens:

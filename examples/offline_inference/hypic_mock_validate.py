@@ -55,7 +55,7 @@ def bootstrap(root):
     sys.modules[operator.__name__] = operator
 
 
-def run_npu(root, doc_len):
+def run_npu(root, doc_len, compose_backend="torch", compose_batch_size=1):
     import torch_npu  # noqa: F401
 
     from vllm_ascend.hypic.attention import forward_hypic_attention, reference_suffix_attention
@@ -92,6 +92,8 @@ def run_npu(root, doc_len):
         slots, ready = {}, {}
         layer = SimpleNamespace(
             prefix="mock.gdn",
+            hypic_state_compose_backend=compose_backend,
+            hypic_state_compose_batch_size=compose_batch_size,
             conv1d=SimpleNamespace(weight=weight, bias=bias),
             activation="silu",
             hypic_conv_pool=torch.empty((2, width - 1, channels), device=device, dtype=dtype),
@@ -243,6 +245,8 @@ def main():
     parser.add_argument("--unit-tests", action="store_true")
     parser.add_argument("--npu", action="store_true")
     parser.add_argument("--doc-len", type=int, default=512)
+    parser.add_argument("--compose-backend", choices=["torch", "triton"], default="torch")
+    parser.add_argument("--compose-batch-size", type=int, default=1)
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[2]
     bootstrap(root)
@@ -257,13 +261,16 @@ def main():
                     f"--confcutdir={folder}",
                     str(folder / "test_hypic.py"),
                     str(folder / "test_block_native_pic.py"),
+                    str(folder / "test_compose.py"),
                 ]
             )
         )
     if args.npu:
         if args.doc_len <= 0:
             parser.error("--doc-len must be positive")
-        run_npu(root, args.doc_len)
+        if args.compose_batch_size <= 0:
+            parser.error("--compose-batch-size must be positive")
+        run_npu(root, args.doc_len, args.compose_backend, args.compose_batch_size)
     else:
         parser.error("choose --unit-tests or --npu")
 

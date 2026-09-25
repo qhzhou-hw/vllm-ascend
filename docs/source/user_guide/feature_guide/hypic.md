@@ -176,6 +176,33 @@ parity across kernels/devices. Ascend random-weight operator tests passed for
 Full-engine and model-level accuracy validation remain pending.
 See the [training-alignment notes](../../developer_guide/hypic_block_native_alignment_zh.md).
 
+### Experimental ordered state-composition backend
+
+`state_compose_backend="torch"` remains the default. The opt-in `"triton"`
+backend fuses ordered FP32 GDN state composition across heads and value rows;
+`state_compose_batch_size` (default `1`) bounds the number of requests
+whose live workspaces are grouped into one composition launch. Larger groups
+can increase peak memory. Neither option changes segment order, seam handling,
+or history reset.
+
+When every Document is cached and no seam needs recomputation, both backends
+compose only the cached Document summaries and run Query once, using its actual
+final state for native decode. They do not compute Query S/T. Query-only legacy
+plans use the same fast path. Requests with a miss or a fresh seam retain the
+original packed three-pass execution, including legacy prefix-seeded replay.
+Each layer retains at most eight immutable, device-qualified sequence-layout
+tensors to reuse GDN metadata; this is not an additional segment/state cache.
+
+On Ascend 910B2, the optimized vector implementation shares transition tiles
+across eight value rows and packs metadata into one upload. It is **2.03–5.13×
+faster than the first experimental kernel** on the tested 128×128 workloads.
+Larger composition groups/sequences also outperform the torch reference, but
+four-segment single-request workloads remain slower. Group size four requires
+`state_compose_batch_size=4`, not merely scheduler batch size four. These are
+composition-call timings, not model-level TTFT speedups. This backend is not enabled
+automatically and does not silently fall back on compiler errors. See the
+[design, measured results and mock benchmark instructions](../../developer_guide/hypic_state_compose_optimization_zh.md).
+
 `max_cache_segments` sizes fixed model-owned attention and GDN state pools.
 vLLM accounts for these buffers before sizing its ordinary KV cache. Admitted
 hits keep their slots for the whole forward. If the pool cannot store all new

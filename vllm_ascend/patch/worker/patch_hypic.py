@@ -81,6 +81,8 @@ def _gdn_init(
     hypic_config = get_hypic_config(vllm_config)
     if not hypic_config.enabled:
         return
+    self.hypic_state_compose_backend = hypic_config.state_compose_backend
+    self.hypic_state_compose_batch_size = hypic_config.state_compose_batch_size
     slots = hypic_config.max_cache_segments
     local_value_heads = self.num_v_heads // self.tp_size
     state_shape = (slots, local_value_heads, self.head_v_dim, self.head_k_dim)

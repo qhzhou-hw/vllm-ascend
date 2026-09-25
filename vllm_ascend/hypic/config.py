@@ -22,6 +22,10 @@ class HypicConfig:
     mode: str = "transition_rope_recompute"
     # Only affects legacy HYPIC. block_native_pic always resets convolution.
     reset_conv_history: bool = False
+    # Experimental execution backend, not a change to cached S/T semantics.
+    state_compose_backend: str = "torch"
+    # Bound live request workspaces when opting into the fused backend.
+    state_compose_batch_size: int = 1
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any] | None) -> HypicConfig:
@@ -37,6 +41,14 @@ class HypicConfig:
 
     def validate(self) -> None:
         """Reject settings outside the implemented algorithm contract."""
+        if self.state_compose_backend not in {"torch", "triton"}:
+            raise ValueError("hypic_config.state_compose_backend must be 'torch' or 'triton'")
+        if (
+            isinstance(self.state_compose_batch_size, bool)
+            or not isinstance(self.state_compose_batch_size, int)
+            or self.state_compose_batch_size <= 0
+        ):
+            raise ValueError("hypic_config.state_compose_batch_size must be a positive integer")
         if not isinstance(self.reset_conv_history, bool):
             raise ValueError("hypic_config.reset_conv_history must be a boolean")
         if self.mode not in {"transition_rope_recompute", "block_native_pic"}:

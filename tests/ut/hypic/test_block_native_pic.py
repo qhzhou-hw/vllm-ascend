@@ -6,6 +6,7 @@ checkout; it skips explicitly when that optional training source is absent.
 """
 
 import importlib.util
+from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -14,6 +15,7 @@ import torch
 import torch.nn.functional as F
 
 from vllm_ascend.hypic.attention import forward_hypic_attention
+from vllm_ascend.hypic.compose import compose_reference
 from vllm_ascend.hypic.config import HypicConfig
 from vllm_ascend.hypic.gdn import forward_hypic_gdn
 from vllm_ascend.hypic.planner import build_plan, validate_plan
@@ -45,7 +47,7 @@ def _rule(q, k, v, g, beta, initial_state=None, **kwargs):
 
 def _kernel(layer, q, k, v, g, beta, initial, cu):
     outputs, states = [], []
-    bounds = cu.tolist()
+    bounds = cu.tolist() if cu is not None else [0, q.shape[1]]
     for index, (start, end) in enumerate(zip(bounds, bounds[1:])):
         out, state = _rule(
             q[:, start:end],
@@ -266,3 +268,184 @@ def test_direct_mindspeed_training_primitives_match(monkeypatch):
     block_allowed = (ids[0, :, None] == ids[0, None, :]) | (ids[0, :, None] == 2)
     expected_mask = block_allowed & torch.ones((6, 6), dtype=torch.bool).tril()
     assert torch.equal(mask[0, 0].eq(0), expected_mask)
+
+
+@pytest.mark.parametrize(
+    "mode,seam,reset",
+    [
+        ("transition_rope_recompute", 0, False),
+        ("transition_rope_recompute", 1, False),
+        ("transition_rope_recompute", 1, True),
+        ("block_native_pic", 0, True),
+    ],
+)
+@pytest.mark.parametrize("group_size", [1, 2, 3])
+def test_deferred_request_groups_match_original_path(monkeypatch, mode, seam, reset, group_size):
+    """Test batching plumbing with a reference composer, not a fake NPU success."""
+    from vllm_ascend.hypic.gdn import _finish_fused_group, _forward_hypic_gdn_request
+
+    def reference_batch(zeros, transforms, zero_pool, transition_pool, steps):
+        results = [compose_reference(s, t, zero_pool, transition_pool, p) for s, t, p in zip(zeros, transforms, steps)]
+        return [r[0] for r in results], torch.stack([r[1] for r in results])
+
+    monkeypatch.setattr("vllm_ascend.hypic.gdn.compose_fused_batch", reference_batch)
+    monkeypatch.setattr("vllm_ascend.hypic.gdn._run_gdn", _kernel)
+    monkeypatch.setattr(
+        "vllm_ascend.hypic.gdn.DeviceOperator.fused_gdn_gating", lambda log, a, b, bias: (a[None], b[None])
+    )
+    reference_layer = _layer()
+    for name in ("hypic_conv_pool", "hypic_zero_state_pool", "hypic_transition_pool"):
+        pool = getattr(reference_layer, name)
+        setattr(reference_layer, name, torch.zeros_like(pool).repeat(2, *([1] * (pool.ndim - 1))))
+    reference_layer.kv_cache = tuple(
+        torch.zeros_like(t).repeat(4, *([1] * (t.ndim - 1))) for t in reference_layer.kv_cache
+    )
+    fused_layer = deepcopy(reference_layer)
+    config = HypicConfig(mode=mode, chunk_size=4, seam_sink_tokens=seam, reset_conv_history=reset)
+    token_lists = [[0, 1, 2, 3, 4, 5], [2, 3, 6, 7, 4, 5]]
+    ready, slots = {}, {}
+    torch.manual_seed(37)
+    raw_table, a_table, b_table = torch.randn((8, 6)), -torch.rand((8, 1)), torch.rand((8, 1))
+    for phase in range(3):  # cold, warm, then cache-only/fresh requests in the same group
+        plans = {
+            str(i): build_plan(tokens, {} if phase == 2 and i % 2 else ready, config, segment_boundaries=[0, 2, 4, 6])
+            for i, tokens in enumerate(token_lists)
+        }
+        writers = set()
+        for plan in plans.values():
+            for segment in plan["segments"]:
+                digest = segment["hash"]
+                if segment["cacheable"]:
+                    slots.setdefault(digest, len(slots))
+                # Phase 2 forces a compute-only miss of an already-ready key.
+                # PicCacheCoordinator never overwrites ready/pinned entries;
+                # preserve that contract when bypassing it in this fixture.
+                segment["store"] = (
+                    segment["cacheable"] and not segment["hit"] and digest not in writers and digest not in ready
+                )
+                if segment["store"]:
+                    writers.add(digest)
+        context = HypicBatchContext(plans, tuple(plans), SimpleNamespace(lookup=slots.get))
+        tensors = [
+            torch.cat([table[tokens][plans[str(i)]["query_positions"]] for i, tokens in enumerate(token_lists)])
+            for table in (raw_table, b_table, a_table)
+        ]
+        metadata = SimpleNamespace(
+            num_actual_tokens=len(tensors[0]), non_spec_state_indices_tensor=torch.tensor([3, 0])
+        )
+        reference_out = torch.empty((len(tensors[0]), 1, 2))
+        fused_out = torch.empty_like(reference_out)
+        forward_hypic_gdn(reference_layer, *tensors, reference_out, context, metadata)
+        pending, offset = [], 0
+        for row, request_id in enumerate(context.request_ids):
+            end = offset + len(plans[request_id]["query_positions"])
+            _forward_hypic_gdn_request(
+                fused_layer,
+                *(t[offset:end] for t in tensors),
+                fused_out[offset:end],
+                context,
+                metadata,
+                request_id,
+                row,
+                pending=pending,
+            )
+            offset = end
+            if len(pending) == group_size:
+                _finish_fused_group(fused_layer, pending, metadata)
+                pending.clear()
+        if pending:
+            _finish_fused_group(fused_layer, pending, metadata)
+        torch.testing.assert_close(fused_out, reference_out)
+        for actual, expected in zip(fused_layer.kv_cache, reference_layer.kv_cache):
+            torch.testing.assert_close(actual, expected)
+        for name in ("hypic_conv_pool", "hypic_zero_state_pool", "hypic_transition_pool"):
+            torch.testing.assert_close(getattr(fused_layer, name), getattr(reference_layer, name))
+        for plan in plans.values():
+            for segment in plan["segments"]:
+                if segment["store"]:
+                    ready[segment["hash"]] = tuple(segment["token_ids"])
+
+
+@pytest.mark.parametrize(
+    "mode,seam", [("block_native_pic", 0), ("transition_rope_recompute", 0), ("transition_rope_recompute", 1)]
+)
+def test_gdn_omits_query_s_t_only_without_fresh_documents(monkeypatch, mode, seam):
+    calls = []
+
+    def tracked(*args):
+        calls.append(args[-1].tolist() if args[-1] is not None else [0, args[1].shape[1]])
+        return _kernel(*args)
+
+    monkeypatch.setattr("vllm_ascend.hypic.gdn._run_gdn", tracked)
+    monkeypatch.setattr(
+        "vllm_ascend.hypic.gdn.DeviceOperator.fused_gdn_gating", lambda log, a, b, bias: (a[None], b[None])
+    )
+    layer = _layer()
+    config = HypicConfig(mode=mode, chunk_size=4, seam_sink_tokens=seam, reset_conv_history=True)
+    raw, a, b = torch.randn((6, 6)), -torch.rand((6, 1)), torch.rand((6, 1))
+    ready, slots = {}, {}
+    for warm in (False, True):
+        plan = build_plan(list(range(6)), ready, config, segment_boundaries=[0, 2, 4, 6])
+        slots.update({s["hash"]: i for i, s in enumerate(plan["segments"][:-1])})
+        positions = plan["query_positions"]
+        context = HypicBatchContext({"r": plan}, ("r",), SimpleNamespace(lookup=slots.get))
+        output = torch.empty((len(positions), 1, 2))
+        calls.clear()
+        forward_hypic_gdn(
+            layer,
+            raw[positions],
+            b[positions],
+            a[positions],
+            output,
+            context,
+            SimpleNamespace(num_actual_tokens=len(positions), prefill_state_indices=torch.tensor([0])),
+        )
+        if seam:
+            assert calls == ([[0, 1, 3]] if warm else [[0, 2, 3, 4, 6]]) * 3
+        elif warm:
+            assert calls == [[0, 2]]  # No fresh Documents: Query only.
+        else:
+            assert calls == [[0, 2, 4, 6]] * 3  # Keep original packed passes on misses.
+        ready = {s["hash"]: tuple(s["token_ids"]) for s in plan["segments"][:-1]}
+
+
+def test_query_only_legacy_is_one_gdn_call(monkeypatch):
+    calls = []
+
+    def tracked(*args):
+        calls.append(args[-1].tolist() if args[-1] is not None else [0, args[1].shape[1]])
+        return _kernel(*args)
+
+    monkeypatch.setattr("vllm_ascend.hypic.gdn._run_gdn", tracked)
+    monkeypatch.setattr(
+        "vllm_ascend.hypic.gdn.DeviceOperator.fused_gdn_gating", lambda log, a, b, bias: (a[None], b[None])
+    )
+    layer = _layer()
+    plan = build_plan([1, 2], {}, HypicConfig(chunk_size=4, seam_sink_tokens=0))
+    context = HypicBatchContext({"r": plan}, ("r",), SimpleNamespace(lookup=lambda _: None))
+    output = torch.empty((2, 1, 2))
+    forward_hypic_gdn(
+        layer,
+        torch.randn((2, 6)),
+        torch.rand((2, 1)),
+        -torch.rand((2, 1)),
+        output,
+        context,
+        SimpleNamespace(num_actual_tokens=2, non_spec_state_indices_tensor=torch.tensor([0])),
+    )
+    assert calls == [[0, 2]]
+
+
+def test_gdn_layout_metadata_cache_is_bounded_and_does_not_cache_state():
+    from vllm_ascend.hypic.gdn import _CU_CACHE_SIZE, _cu_seqlens
+
+    layer = SimpleNamespace()
+    device = torch.device("cpu")
+    first = _cu_seqlens(layer, [3, 4], device)
+    assert _cu_seqlens(layer, [3, 4], device) is first
+    assert first.tolist() == [0, 3, 7]
+    for length in range(1, _CU_CACHE_SIZE + 2):
+        _cu_seqlens(layer, [length], device)
+    assert len(layer._hypic_gdn_cu_cache) == _CU_CACHE_SIZE
+    assert _cu_seqlens(layer, [3, 4], device) is not first
+    assert first.tolist() == [0, 3, 7]  # Eviction does not mutate tensor owners.
