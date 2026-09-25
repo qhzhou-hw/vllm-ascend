@@ -134,8 +134,41 @@ def run_case(args, batch_size, segments, case):
         finally:
             compose_triton.launch_compose = current
 
+    def packed_baseline():
+        from vllm_ascend.hypic import compose_triton
+
+        current = compose_triton.launch_compose
+        try:
+            compose_triton.launch_compose = args.packed_launch
+            return fused()
+        finally:
+            compose_triton.launch_compose = current
+
     saved_pools = zero_pool.clone(), transition_pool.clone()
     expected = reference()
+
+    def native_baseline():
+        from vllm_ascend.hypic import compose_triton
+
+        current = compose_triton.launch_compose
+        try:
+            compose_triton.launch_compose = args.native_launch
+            return fused()
+        finally:
+            compose_triton.launch_compose = current
+
+    if getattr(args, "native_launch", None):
+        native_replay, native_final = native_baseline()
+        for row, (replay, final) in enumerate(expected):
+            torch.testing.assert_close(native_replay[row], replay, atol=2e-5, rtol=2e-4)
+            torch.testing.assert_close(native_final[row], final, atol=2e-5, rtol=2e-4)
+        del native_replay, native_final
+    if getattr(args, "packed_launch", None):
+        packed_replay, packed_final = packed_baseline()
+        for row, (replay, final) in enumerate(expected):
+            torch.testing.assert_close(packed_replay[row], replay, atol=2e-5, rtol=2e-4)
+            torch.testing.assert_close(packed_final[row], final, atol=2e-5, rtol=2e-4)
+        del packed_replay, packed_final
     if args.before_root:
         old_replay, old_final = before()
         for row, (replay, final) in enumerate(expected):
@@ -154,6 +187,10 @@ def run_case(args, batch_size, segments, case):
     functions = {"torch": reference, "after": fused}
     if args.before_root:
         functions["before"] = before
+    if getattr(args, "packed_launch", None):
+        functions["packed"] = packed_baseline
+    if getattr(args, "native_launch", None):
+        functions["native"] = native_baseline
     for _ in range(3):
         for fn in functions.values():
             fn()
@@ -161,6 +198,9 @@ def run_case(args, batch_size, segments, case):
     reference_ms, fused_ms = timings["torch"], timings["after"]
     reference_peak = peak_workspace(reference)
     fused_peak = peak_workspace(fused)
+    before_peak = peak_workspace(before) if args.before_root else None
+    packed_peak = peak_workspace(packed_baseline) if getattr(args, "packed_launch", None) else None
+    native_peak = peak_workspace(native_baseline) if getattr(args, "native_launch", None) else None
     torch.testing.assert_close(zero_pool, saved_pools[0], rtol=0, atol=0)
     torch.testing.assert_close(transition_pool, saved_pools[1], rtol=0, atol=0)
     # Recheck after repeated launches; metadata owners must remain stream-safe.
@@ -185,6 +225,11 @@ def run_case(args, batch_size, segments, case):
                 "speedup": reference_ms / fused_ms,
                 "metadata_included": True,
                 "before_ms": timings.get("before"),
+                "packed_ms": timings.get("packed"),
+                "native_ms": timings.get("native"),
+                "native_workspace_bytes": native_peak,
+                "packed_workspace_bytes": packed_peak,
+                "before_workspace_bytes": before_peak,
                 "before_speedup": timings["before"] / fused_ms if args.before_root else None,
                 "torch_workspace_bytes": reference_peak,
                 "triton_workspace_bytes": fused_peak,

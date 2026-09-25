@@ -408,3 +408,414 @@ group=4 从约 **2.293 MiB 降为 1.663 MiB**。这不包含已有 segment pool�
 output 一致，也不能推广为所有输入、所有层和所有后续 decode 步骤逐位一致。
 真实模型 TTFT、变长布局持续抖动时的 metadata 缓存收益，以及训练后模型的任务
 准确率，仍需要后续模型级验证。当前仅交付上述验证范围内的实现。
+
+## 8. FP32 Cube 实验（2026-09-25）
+
+### 8.1 结论与交付范围
+
+**长 segment 链存在收益，但目前不适合替换生产 Vector 路径。** 本轮只新增
+`examples/offline_inference/hypic_compose_cube.py` 和 `hypic_cube_probe.py` 实验入口，
+不新增生产 backend，不改变 `HypicConfig` 默认值，不修改缓存池、调度器、seam 或
+conv history 语义。实验脚本仅在自己的进程内临时替换 composition launcher。
+
+服务器为 Ascend 910B2；torch 2.10.0、torch-npu 2.10.0、triton-ascend 包 3.2.2、
+sgl-kernel-npu 2026.9.0。所有数值测试均在服务器使用 mock 张量；未下载模型，
+未在本地运行数值测试。Vector 基线来自提交 `89bc2e750`，前后快照的
+`compose_triton.py` SHA256 均为
+`9008eee2a32ede3a8b6221e72693943494c5a1f1e1af58e1975bcd7bb693fed8`。
+
+### 8.2 尝试了哪些实现
+
+所有候选仍按原顺序计算 `H_i = H_(i-1) @ T_i + S_i`，首段直接取 `S_0`；
+输入、状态与累加器保持 FP32，`tl.dot(input_precision="ieee")`，未采用
+BF16/TF32/HF32 近似或改变段的组合顺序。编译产物含 `linalg.matmul`、
+`mix_mode="mix"`，诊断 kernel 的二进制符号同时含 `_mix_aic` 和 `_mix_aiv`，
+确实涉及 Cube/Vector 混合执行，不是给 Vector reduction 改名。
+
+| 候选 | 本轮观察 | 处理 |
+| --- | --- | --- |
+| 原缓存池直接读取、单 kernel 融合 | 16 行 tile 的单位矩阵检查有 75% 元素错误，最大绝对误差 1 | 拒绝进入生产 |
+| 缓存指针表 + 每段独立 kernel | 同样未通过单位矩阵检查 | 拒绝进入生产 |
+| 每段直接传 S/T 张量参数 | 精度检查通过，但 batch=4、64 段为 53.02 ms，Vector 为 7.63 ms | 仅作正确性对照 |
+| 连续打包 S/T + 128 行 tile 融合 | 已测范围内正确，64 段有收益；短链较慢，临时显存较大 | 保留实验入口 |
+
+最小复现进一步区分了“直接张量参数”“同一 allocation 内按段索引”、动态循环
+和静态展开。两段输入的部分 tile 会失败，较多段或 128 行 tile 可以通过。
+关闭 tightly-coupled buffer reuse、关闭 auto-bind sub-block、启用 Vector ND2NZ
+三种独立选项均未修复该最小复现。直接缓存池版本增大到 128 行 tile 又遇到
+UB 编译溢出：需要 3,145,728 bits，可用 1,572,864 bits。
+
+这些是当前编译/执行栈的可复现现象，尚未定位到具体编译 pass；不能解释为
+普通舍入误差，也不能宣称已修复通用的 FP32 Cube 支持。失败候选保留用于诊断，
+不会在精度失败后静默回退并继续发布性能结果。
+
+### 8.3 打包融合候选与延迟
+
+`--cube-variant packed --cube-rows 128` 先按请求的实际 segment 顺序，分别
+`torch.stack` 对应 S/T（命中时取 pool，miss 时取 fresh）。每请求启动一个
+持久 kernel，每个 head 独立计算；请求之间仍由 host 逐一提交。最终状态与
+replay 按原位置写回。不要求各请求有相同段数。
+
+block-native 仅末段需要 replay 时，历史缓冲只保留两个循环槽；legacy 多段
+需要 replay 时保留完整前缀状态。显式释放上一请求的 packed 输入和历史缓冲，
+避免它们跨越下一请求的打包分配。**这仍不是现有静态 segment pool 的零拷贝路径**，
+临时打包内存尚未纳入生产池预算，因此不自动接入 engine。
+
+下表为同进程、相同输入、轮换计时顺序的最终实测：8 heads、K=V=128、
+block-native warm，batch 内第 r 个请求的 Document 数为 `max(1, N-r)`，
+另有一个 fresh Query。每组 5 次计时、每次 10 次调用，取中位数，排除 JIT。
+延迟包含校验、Python 调度、S/T 打包、分配、状态组合和 replay 写回；不是纯 Cube
+指令耗时，也不是完整模型 TTFT。对照列是本轮测量，不混用上一日的结果。
+
+| Batch | Document 数 N | Vector ms | Packed Cube ms | Vector / Cube | Cube 额外峰值 MiB |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 4 | 0.469 | 0.572 | 0.82× | 7.50 |
+| 1 | 16 | 0.796 | 0.736 | 1.08× | 20.50 |
+| 1 | 64 | 2.283 | 1.279 | 1.79× | 98.00 |
+| 4 | 4 | 0.593 | 1.840 | 0.32× | 7.50 |
+| 4 | 16 | 1.963 | 2.420 | 0.81× | 20.50 |
+| 4 | 64 | 7.427 | 4.837 | 1.54× | 98.00 |
+
+峰值为输入池分配之后单次调用的额外 allocator 峰值，包含打包与内部 workspace，
+不是模型总显存。仅凭上述数据不能制定通用的 16/64 段 backend 切换阈值；
+不同 head 数、形状、请求分组和内存预算仍需验证。
+
+### 8.4 复现与后续方向
+
+最终候选验证结果：
+
+- 主组合对照共 **26 组**：6 组 warm、8 组 cold/mixed、12 组 legacy；最终状态
+  和 replay 在这些输入上相对 FP32 参考的最大绝对差均为 **0**。覆盖 bs=1/4、
+  非交换 T、不同顺序、变长段数、重复调用和缓存池不被修改。
+- `cube-packed-edges.log`：4 组空序列/cache-only 边界、单位矩阵检查、
+  1 Document + Query 对照通过。零 fresh S/T 的 GDN 快路径仍可使用该实验 launcher。
+- `cube-packed-training.log`：**10 项 NPU mock 检查通过**，其中 8 项 GDN 覆盖
+  bs=1/4 的 cold/warm/reordered/changed-prefix，另有 2 项 attention 检查。
+  GDN 对训练原语的 output 最大绝对差为 **9.54e-6**，最终状态为 **1.04e-4**，
+  使用既有容差，未放宽精度要求。它不是模型权重/完整 engine 的端到端验证。
+- `cube-existing-unit.log`：服务器上的原有 tensor/metadata 回归 **85 passed**；
+  两个新脚本 Ruff 检查、格式检查以及 `git diff --check` 通过。
+
+远端原始记录保留在 `/data/hypic-cube-validation-20260925/`，其中 `before/`
+和 `after/` 保存对照快照；最终性能日志为 `cube-packed-final.log`。
+`cube-packed-mixed.log`、`cube-packed-legacy.log`、`cube-packed-training.log`
+分别记录混合命中、legacy replay 和训练原语对照。
+
+在服务器 `after/` 中运行：
+
+```bash
+python examples/offline_inference/hypic_compose_cube.py \
+  --cube-variant packed --cube-rows 128 --before-root ../before \
+  --batch-sizes 1 4 --segments 4 16 64 --cases warm --iterations 10 --repeats 5
+python examples/offline_inference/hypic_compose_cube.py \
+  --cube-variant packed --cube-rows 128 --before-root ../before \
+  --batch-sizes 1 4 --segments 4 16 --cases cold mixed
+python examples/offline_inference/hypic_compose_cube.py \
+  --cube-variant packed --cube-rows 128 --before-root ../before --mode legacy \
+  --batch-sizes 1 4 --segments 4 16 --cases cold mixed warm
+python examples/offline_inference/hypic_compose_cube.py \
+  --cube-variant packed --cube-rows 128 --cube-target mock \
+  --npu --compose-backend triton --compose-batch-size 4
+python examples/offline_inference/hypic_cube_probe.py --segments 2 3 4 --rows 16 32 64 128
+```
+
+最后一条是诊断矩阵，预期包含已知失败并输出 `failures`，不是全通过测试；
+composition benchmark 则遇到精度失败立即退出，不给失败配置计时。误差阈值沿用
+原 benchmark：单位矩阵要求精确一致，随机最终状态/replay 为 `atol=2e-5, rtol=2e-4`。
+
+下一步值得做的是修复直接 pool 访问的混合 kernel 布局问题，或实现有界 tile
+打包及跨请求提交，减少打包、workspace 与 host launch 成本，而不是降低输入精度
+掩盖问题。在这些条件满足并完成模型级测试前，继续使用现有 Vector 实现。
+
+### 8.5 短 segment 链补测（2026-09-25）
+
+固定同一 packed Cube 候选、128 行 tile、FP32、8 heads、K=V=128，在同一台
+910B2 上补测 N=1/2/4/8/16、batch=1/4、warm/cold/mixed，共 30 组。
+每组 7 次计时、每次 20 次调用，轮换后端计时顺序并取中位数；不含 JIT，
+包含打包、分配、组合与 replay 写回。没有改变生产实现或降低精度。
+
+下表为 warm 结果，单位 ms：
+
+| Document 数 N | Batch=1 Vector | Batch=1 Cube | Batch=4 Vector | Batch=4 Cube |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 0.452 | 0.537 | 0.538 | 1.780 |
+| 2 | 0.443 | 0.510 | 0.593 | 1.972 |
+| 4 | 0.448 | 0.547 | 0.591 | 1.925 |
+| 8 | 0.520 | 0.598 | 1.033 | 2.051 |
+| 16 | 0.768 | 0.701 | 1.948 | 2.556 |
+
+沿用上一节的 ragged 输入口径：第 r 个请求实际 Document 数为 `max(1, N-r)`，
+各请求再加一个 fresh Query；因此 N 是批内最大 Document 数，不是统一的总段数。
+这里的“短”指状态组合链的段数，不是完整 prompt token 长度，也不是完整模型
+prefill 延迟。每段在本测试中已表示为 S/T，没有执行对应的 token prefill。
+
+初轮 30 组全部通过，最终状态及 replay 对 FP32 参考的最大绝对差均为 0。
+单位矩阵和空序列/cache-only 边界检查也通过。warm 下，batch=1 的 N<=8
+Cube 慢约 15%–22%；N=16 约快 1.10×。batch=4 的所有这些短链都比 Vector 慢，
+N<=4 约慢至 3.3×，N=8 约 2.0×，N=16 约 1.31×；cold/mixed 趋势相同。
+
+这支持短链继续使用 Vector，而不是把所有请求无条件改成 Cube。当前 packed
+版本仍有每请求的打包与 host 提交，短链的矩乘工作量不足以抵消这些成本；
+这只是结合实现结构的解释，尚未通过 profiler 将各项开销单独定量拆分。
+
+原始日志：`/data/hypic-cube-validation-20260925/cube-short-20260925-a.log`。
+另以 `--seed 20260925 --cases warm` 复测 10 组，记录于同目录
+`cube-short-20260925-b.log`；同样全部通过、最大绝对差 0，合计 40 组。
+复测的 batch=1、N=16 加速比为 1.085×；batch=4、N=16 仍慢 1.37×，
+短链回退趋势没有改变。上表保留初轮独立计时，不把两轮中较好的数值混在一起。
+
+```bash
+python examples/offline_inference/hypic_compose_cube.py \
+  --cube-variant packed --cube-rows 128 --before-root ../before \
+  --batch-sizes 1 4 --segments 1 2 4 8 16 --cases warm cold mixed \
+  --iterations 20 --repeats 7
+```
+
+## 9. 跨请求批量 Cube 优化（2026-09-25）
+
+### 9.1 实现与语义
+
+本轮新增实验模块 `examples/offline_inference/hypic_cube_batch.py`，仍未注册
+生产 backend、修改默认配置或接入正式 engine。`hypic_compose_cube.py` 新增
+`batch`、`native`、`window` 三个候选；原有 `packed` 保持逐请求基线。
+
+- `batch`：batch 内所有 S/T 一次性 stack，然后一次 Cube kernel 和一次
+  Vector scatter。减少逐请求提交，但大 stack 的临时内存仍较大。
+- `native`：用 CANN `index_select` 从原缓存池批量取 S/T，再补入 fresh 段。
+  多个 fresh 段按请求合并 `index_copy_`，避免逐段复制；单 fresh 段仍直接 copy。
+  空缓存池不执行非法 index_select，而是分配后完整填入 fresh/padding。
+- `window`：按固定段数窗口打包，以前一窗口的最终状态作为下一窗口的合成首段 S。
+  已测窗口 16 可以限制工作集，但增加提交次数，性能不如原 packed，保留作诊断。
+
+Cube grid 是 request × head，单 program 处理完整 128×128 FP32 状态。
+不同长度的请求采用**前置** `(S=0, T=I)` 补齐，使实际末段在 batch 内对齐。
+补齐不改变 affine 组合的数学语义；所有实际段保持原顺序，replay 仍对应其入段状态。
+仅末段需 replay 时保留两个循环历史槽；存在更早 replay 目标时保留完整前缀状态。
+实现目前显式要求 K=V=128，不推断它对其他形状也成立。
+
+没有使用 BF16/TF32/HF32 近似，没有树形重排，没有让 miss 改用不同的 GDN 语义。
+动态 segment pool、history reset、seam 和调度器实现均未修改。
+
+### 9.2 先定位打包瓶颈，再选择搬运实现
+
+最初的自写 Triton gather 精度正确，但非常慢。NPU event 分阶段计时，在
+BS=4、64 Documents、8 heads、K/V=128 下测得：
+
+| 阶段 | 设备计时 ms |
+| --- | ---: |
+| Triton gather | 32.882 |
+| Cube chain | 0.838 |
+| 结果/replay scatter | 0.0044 |
+
+增加搬运 tile 到 8192、将 source 分支改为直接地址并提示对齐后，gather 仍为
+32.879 ms。这说明本候选的主要瓶颈在搬运而不是 Cube 矩乘，不能以更高 Cube
+峰值算力解释或解决。尚未定位该 gather 低效的具体编译 pass，不声称已修复它。
+最终 `native` 候选使用 CANN 搬运，不使用这条慢 gather。
+
+复现诊断用 `hypic_cube_profile.py`；它刻意调用 `pack_mode="gather"`，测的是
+被拒绝的搬运候选，不是最终 native 的耗时分解。event 计时排除 JIT，不能代替
+含 Python、元数据上传和分配的整次调用延迟。
+
+### 9.3 测试口径
+
+benchmark 新增 `packed_ms`、`packed_workspace_bytes`、`before_workspace_bytes`，
+在相同输入、同一进程里轮换测量 Torch、现有 Vector、原逐请求 packed 和新候选；
+各后端都先通过最终状态和 replay 精度检查。新候选的结果不能只与更慢的失败
+gather 比较，必须与原 packed 和现有 Vector 分别比较。
+
+新增 `tests/ut/hypic/test_cube_batch_npu.py`，覆盖空缓存池、空请求、变长 batch、
+重复来源、非顺序 replay 目标、1/2 heads、三次连续调用、输入和缓存池不被修改。
+随机 T 非交换；沿用 `atol=2e-5, rtol=2e-4`，未放宽容差。
+
+本轮所有数值测试在同一 Ascend 服务器运行，没有下载模型或本地推理。原始日志
+仍位于 `/data/hypic-cube-validation-20260925/`；`cube-batch-first.log`、
+`cube-batch-tile8192.log`、`cube-batch-stage8192.log`、
+`cube-batch-stage-pointers.log` 保留失败/低效尝试。
+`cube-native-v2-*.log` 记录包含 fresh 合并写入的最终 native 候选。
+
+```bash
+python examples/offline_inference/hypic_compose_cube.py \
+  --cube-variant native --cube-rows 128 --before-root ../before \
+  --batch-sizes 1 4 --segments 1 2 4 8 16 64 --cases warm --iterations 10 --repeats 5
+python examples/offline_inference/hypic_compose_cube.py \
+  --cube-variant native --cube-rows 128 --before-root ../before \
+  --batch-sizes 1 4 --segments 4 16 --cases cold mixed --iterations 5 --repeats 5
+python examples/offline_inference/hypic_compose_cube.py \
+  --cube-variant native --cube-rows 128 --before-root ../before --mode legacy \
+  --batch-sizes 1 4 --segments 4 16 --cases cold mixed warm
+python examples/offline_inference/hypic_compose_cube.py \
+  --cube-variant native --cube-rows 128 --cube-target mock \
+  --npu --compose-backend triton --compose-batch-size 4
+```
+
+### 9.4 最终 native 候选的收益与边界
+
+`cube-native-v2-warm.log`：同进程、相同输入，5 轮、每轮 10 次，取中位数，
+排除 JIT，包含打包、元数据上传、分配及写回。8 heads，K=V=128，沿用前述
+`max(1, N-r)` 个 Documents 加一个 Query 的 ragged 配置。
+以下是 batch=4、warm 的结果，单位 ms：
+
+| 最大 Document 数 N | 现有 Vector | 原逐请求 packed Cube | 新 native 批量 Cube | 相对原 Cube 加速 |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 0.563 | 1.856 | 1.168 | 1.59× |
+| 2 | 0.568 | 1.838 | 1.476 | 1.25× |
+| 4 | 0.610 | 1.923 | 1.511 | 1.27× |
+| 8 | 1.057 | 2.106 | 1.598 | 1.32× |
+| 16 | 1.971 | 2.483 | 1.809 | 1.37× |
+| 64 | 7.446 | 4.959 | 3.096 | 1.60× |
+
+因此本次确实减少了多请求 Cube 的开销，但 **N<=8 仍不如 Vector**；N=16 仅比
+Vector 快约 1.09×，N=64 快约 2.41×，不能把这些倍数当作模型 TTFT 加速比。
+batch=1、N=64 从原 packed 的 1.385 ms 变为 1.400 ms，基本持平；batch=1
+短链则有回退，例如 N=4 从 0.593 ms 变为 0.917 ms。
+
+miss 较多时并非通用优化：batch=4、N=16，cold 的原 packed/新 native 为
+2.643/4.060 ms，mixed 为 2.692/3.290 ms。合并 fresh 写入保证了相同语义，
+但索引上传、池 gather、补写成本仍在，不能仅因 warm 变快就启用所有请求。
+
+额外 allocator 峰值也有代价：
+
+| 配置 | Vector MiB | 原 packed MiB | 新 native MiB |
+| --- | ---: | ---: | ---: |
+| Batch=1、N=64、warm | 约 1.0 | 98.0 | 69.0 |
+| Batch=4、N=64、warm | 约 4.0 | 98.0 | 280.0 |
+
+新方案同时打包整个 batch；原 packed 逐请求执行。不能忽略这一区别或把 280 MiB
+算作输入缓存已占的内存。上述峰值是输入池分配后的单次调用额外峰值，生产
+segment pool 显存预算尚未为它预留空间。
+
+结论：保留原 Vector/packed 路径和显式实验入口，不默认切换后端，不增加未经验证的
+自动段数阈值。下一步应优先减少/消除 batch 打包内存，并建立带显存上限的请求分组，
+再评估完整 engine 与模型级收益。本轮代码没有下载模型、运行 LongBench/MCPAgentBench
+或改动它们的配置。
+
+### 9.5 最终验证记录
+
+- `cube-native-v2-warm.log` / `mixed.log` / `legacy.log`：12 + 8 + 12，共
+  **32 组**前后对照通过，最终状态与 replay 相对 FP32 参考的最大绝对差均为 **0**。
+- `cube-native-v2-training.log`：**10 项**真实 NPU mock 检查通过，包含 bs=1/4
+  的 cold/warm/reordered/changed-prefix GDN 和 attention；GDN output 最大绝对差
+  **9.54e-6**，最终状态 **1.04e-4**，沿用既有阈值。
+- `cube-native-v2-unit-scoped.log`：原有 tensor/metadata 85 项与新增 NPU 回归
+  8 项，合计 **93 passed**。新增回归覆盖 `batch` 的 torch pack 和 `native`
+  两种搬运路径，检查重复调用和所有输入张量不变。
+- `cube-native-v2-unit.log` 是一次扩大到整个测试目录的收集失败记录：
+  `test_pic_adapter.py` 需要完整 `vllm` 包，而当前 mock venv 未安装该包。
+  后续只运行明确可在该环境执行的上述 4 个测试文件，没有把收集失败标作通过；
+  未重新构建完整 vLLM engine。
+- 5 个本轮 Python 文件 Ruff 检查、格式检查通过，`git diff --check` 通过。
+  服务器与本地实验实现/测试的 SHA256 已核对一致。
+
+因此本轮交付是经过 NPU 算子/缓存 plumbing 验证的实验实现与性能记录，
+不是所有场景更快、显存无额外成本或完整模型准确率已验证的生产 backend。
+
+## 10. 直接索引 Cube：省去 S/T 打包
+
+本节是第 9 节之后的进一步实验，入口是
+`hypic_compose_cube.py --cube-variant indexed --cube-rows 128`。
+代码仍位于 examples，**没有替换生产 Vector 内核或改变默认后端**。
+
+### 10.1 实现与语义
+
+- Host 把 hit 的 pool slot 和 miss 的 fresh unit 转为 S/T 原始张量地址，
+  上传一个包含地址、请求长度和 replay 目标的 int64 packet。
+  每请求的基础地址只查询一次，不再按段重复调用 `data_ptr()`。
+- Cube grid 仍为 request × head，每个 program 处理完整 128×128 状态；
+  直接读取 packet 指向的 S/T，**没有 S/T gather、stack、index_copy 或 batch 打包**。
+  kernel 内不再区分 hit/miss，仅保留有序递推 `H_i = H_(i-1) @ T_i + S_i`。
+- 按每个请求的实际段数循环，不添加 identity padding，不把段改成树形归并，
+  不改变非交换 T 的顺序。首段仍直接取 S，空序列结果为零。
+- 只有末段需要 replay 时保留两个 history 槽；中间段需要 replay 时保留全部前缀。
+  单独的 Vector scatter 按实际长度取出 final 和各段的**输入状态**，支持非顺序目标。
+- 当且仅当所有 fresh replay 单元都会被写入时，使用 `empty_like` 省去清零；
+  未被 replay 指定的单元依旧初始化为零。没有改变 block-native 的 fresh Document 语义。
+- FP32 输入、累加与 IEEE dot 不变，没有 TF32/BF16 降精度，也没有放宽误差阈值。
+
+空请求的第一条地址指向本次调用持有的零张量，避免读取空 pool/fresh tensor。
+这不是有意义的额外 segment：循环仍为零段，final 读取 H0。
+直接在 kernel 中以 `if count > 0` 初始化整块 state 的版本触发了 UB overflow：
+编译器报告需要 2097152 bits、可用 1572864 bits。失败日志为
+`cube-indexed-ragged.log`，保留在服务器；最终版本去掉该初始化分支后通过验证。
+这是对当前编译器行为的实测规避，不声称修复了编译器本身。
+
+### 10.2 同进程前后延迟与显存
+
+服务器目录仍为 `/data/hypic-cube-validation-20260925/after`。
+优化前模块在修改前保存为 `examples/offline_inference/hypic_cube_native_v2.py`，
+SHA256 为 `b647d9be36a2a00cd6960e54b7a7576335f1cc7ef03ad7cc9abe703b14c5277d`。
+新增 `--cube-baseline-module` 可以导入这个冻结副本，结果中的 `native_ms` /
+`native_workspace_bytes` 专门记录上一轮 native V2，而不是与历史日志跨进程比速度。
+
+`cube-indexed-final.log`：固定 seed=20260924，8 heads、K=V=128；
+同进程、同输入，轮换后端顺序，每轮 10 次、5 轮中位数，排除 JIT，
+包含验证包装、Host 地址处理、上传、分配、Cube 与 scatter。
+N 为最大 Document 数；请求 r 包含 `max(1, N-r)` 个 Document 和一个 Query，
+不是所有请求等长，也不是 prompt token 数。
+
+BS=4、warm（Documents 全命中），单位 ms：
+
+| N | 现有 Vector | 上轮 native V2 | 本轮 indexed | 相对上轮加速 |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 0.566 | 1.167 | 0.713 | 1.64× |
+| 2 | 0.558 | 1.459 | 0.698 | 2.09× |
+| 4 | 0.655 | 1.640 | 0.798 | 2.06× |
+| 8 | 1.065 | 1.733 | 0.855 | 2.03× |
+| 16 | 1.978 | 1.862 | 1.024 | 1.82× |
+| 64 | 7.435 | 3.041 | 2.045 | 1.49× |
+
+BS=4、N=64、warm 的额外 allocator 峰值从 **280.01 MiB 降到 12.01 MiB**，
+减少约 95.7%；现有 Vector 仍约 4 MiB。indexed 不是零 workspace：
+仍包含 replay/final、history、元数据及 allocator 计入的内部工作空间。
+BS=1、N=64、warm 从 1.294 ms / 69 MiB 变为 0.957 ms / 5 MiB。
+
+cold/mixed 不再需要先 gather 缓存再补写 fresh，因此也有收益：
+
+| BS | N | 场景 | Vector ms | native V2 ms | indexed ms | native / indexed MiB |
+| ---: | ---: | --- | ---: | ---: | ---: | ---: |
+| 4 | 16 | cold | 1.999 | 3.731 | 1.095 | 118.01 / 43.00 |
+| 4 | 16 | mixed | 2.020 | 3.214 | 1.159 | 102.01 / 26.01 |
+| 4 | 64 | cold | 7.493 | 11.022 | 2.164 | 405.51 / 139.50 |
+| 4 | 64 | mixed | 7.470 | 7.259 | 2.099 | 342.51 / 75.01 |
+
+cold 的 replay 输出随 fresh 单元数增加，legacy 中间 replay 还要求保存前缀，
+不能把 warm 的 12 MiB 推广到所有场景。短链仍有边界：BS=4、N<=4 和
+BS=1、N<=8 的 indexed 尚不如现有 Vector；例如 BS=1、N=4 为 0.587 对 0.465 ms。
+没有据此引入未经引擎验证的自动阈值。
+
+复现最终 block-native 对照：
+
+```bash
+python examples/offline_inference/hypic_compose_cube.py \
+  --cube-variant indexed --cube-rows 128 \
+  --cube-baseline-module hypic_cube_native_v2 --before-root ../before \
+  --batch-sizes 1 4 --segments 1 2 4 8 16 64 --cases warm cold mixed \
+  --iterations 10 --repeats 5
+```
+
+没有冻结模块时可省略 `--cube-baseline-module`，仍会与原逐请求 packed 和
+`--before-root` 指定的生产 Vector 作同输入比较。不要把 indexed 自身作为 native 基线。
+
+### 10.3 验证范围与剩余限制
+
+- `cube-indexed-final.log`：36 组 block-native 对照，覆盖 BS=1/4，
+  N=1/2/4/8/16/64，cold/mixed/warm，final/replay 最大绝对差均为 0。
+- `cube-indexed-final-legacy.log`：24 组 legacy 对照，覆盖 BS=1/4，
+  N=1/4/16/64，三种命中模式，最大绝对差均为 0。
+- `cube-indexed-final-training.log`：10 项真实 NPU mock GDN/attention 检查通过；
+  GDN output 最大绝对差 9.54e-6，最终状态 1.04e-4，与上轮相同阈值。
+- 新增 indexed 回归覆盖空请求、空 pool、重复命中、非顺序 replay、
+  1/2 heads、1/2/3/4/16/65 段、两槽 ring 奇偶边界、全部/末段 replay、
+  三次重复调用、非交换随机 T 和全部输入不可变。
+- `cube-indexed-final-unit.log`：4 个指定测试文件合计 **109 passed**，
+  包含原有 85 项与本实验 24 项；没有把缺少完整 vLLM 包的整目录收集标作通过。
+  本轮修改的 4 个 Python 文件通过 Ruff 检查/格式检查，`git diff --check` 通过。
+
+当前没有 full engine 构建/并发请求、跨 stream、图捕获或模型权重准确率测试。
+地址 packet 指向的输入张量必须在异步 kernel 使用期间有效，不能在其他 stream
+复用或驱逐对应 pool slot；生产接入仍需结合现有调度器 pin/reserve 生命周期，
+并为 history/replay 预算显存。例：BS=4、N=64、legacy cold 的额外峰值仍为
+266.51 MiB（native V2 为 526.51 MiB），不能把它视为已解决所有显存预算问题。
+
+所有数值验证均在 Ascend 上使用 mock tensors/weights，无模型下载，无本地推理。
+以上是状态组合调用延迟，不是整模型 TTFT；保留原 Vector、packed、native 对照，
+后续生产接入需单独验证，不能把实验入口等同于默认推理路径已加速。
