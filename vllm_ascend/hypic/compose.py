@@ -95,20 +95,24 @@ def compose_fused_batch(
         raise ValueError("HYPIC triton composition requires contiguous FP32 tensors on the same NPU")
     if zero_pool.ndim != 4 or zero_pool.shape[1:] != (heads, value_dim, key_dim):
         raise ValueError("HYPIC zero-state pool shape mismatch")
-    if transition_pool.shape != (len(zero_pool), heads, key_dim, key_dim):
+    # Snapshot counts per call, not per segment: Tensor.__len__ repeatedly
+    # dispatches through PyTorch even though these shapes cannot change here.
+    pool_units = zero_pool.shape[0]
+    if transition_pool.shape != (pool_units, heads, key_dim, key_dim):
         raise ValueError("HYPIC transition pool shape mismatch")
     for zeros, transforms, sequence in zip(zero_states, transitions, steps):
         if zeros.ndim != 4 or zeros.shape[1:] != (heads, value_dim, key_dim):
             raise ValueError("HYPIC fresh zero-state shape mismatch")
-        if transforms.shape != (len(zeros), heads, key_dim, key_dim):
+        fresh_units = zeros.shape[0]
+        if transforms.shape != (fresh_units, heads, key_dim, key_dim):
             raise ValueError("HYPIC fresh transition shape mismatch")
         targets = [step.replay for step in sequence if step.replay >= 0]
         if len(targets) != len(set(targets)):
             raise ValueError("HYPIC composition cannot write a replay unit twice")
         for step in sequence:
-            if not (-len(zero_pool) <= step.source < len(zeros)):
+            if not (-pool_units <= step.source < fresh_units):
                 raise ValueError("HYPIC composition source index out of bounds")
-            if not (-1 <= step.replay < len(zeros)):
+            if not (-1 <= step.replay < fresh_units):
                 raise ValueError("HYPIC composition replay index out of bounds")
 
     # Lazy import keeps the default path usable without a Triton compiler.

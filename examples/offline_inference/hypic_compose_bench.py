@@ -104,10 +104,13 @@ def run_case(args, batch_size, segments, case):
             else:
                 sequence.append(ComposeStep(unit, unit if args.mode == "legacy" else -1))
                 unit += 1
-        sequence.append(ComposeStep(unit, unit))
-        zeros = torch.randn((unit + 1, heads, value_dim, dim), device=device) * 0.02
+        fresh_count = unit
+        if not args.cache_only:
+            sequence.append(ComposeStep(unit, unit))
+            fresh_count += 1
+        zeros = torch.randn((fresh_count, heads, value_dim, dim), device=device) * 0.02
         transforms = (
-            torch.randn((unit + 1, heads, dim, dim), device=device) * (0.03 / dim**0.5) + identity * 0.9
+            torch.randn((fresh_count, heads, dim, dim), device=device) * (0.03 / dim**0.5) + identity * 0.9
         ).contiguous()
         fresh_s.append(zeros)
         fresh_t.append(transforms)
@@ -147,15 +150,44 @@ def run_case(args, batch_size, segments, case):
     saved_pools = zero_pool.clone(), transition_pool.clone()
     expected = reference()
 
-    def native_baseline():
+    def native_baseline(launch=None, api=None):
         from vllm_ascend.hypic import compose_triton
 
         current = compose_triton.launch_compose
         try:
-            compose_triton.launch_compose = args.native_launch
-            return fused()
+            compose_triton.launch_compose = args.native_launch if launch is None else launch
+            return (api or compose_fused_batch)(fresh_s, fresh_t, zero_pool, transition_pool, steps)
         finally:
             compose_triton.launch_compose = current
+
+    def indexed_baseline():
+        return native_baseline(args.indexed_launch)
+
+    def output_baseline():
+        return native_baseline(args.output_launch, getattr(args, "output_api", None))
+
+    def output_current_api():
+        return native_baseline(args.output_launch)
+
+    if getattr(args, "output_launch", None):
+        output_replay, output_final = output_baseline()
+        for row, (replay, final) in enumerate(expected):
+            torch.testing.assert_close(output_replay[row], replay, atol=2e-5, rtol=2e-4)
+            torch.testing.assert_close(output_final[row], final, atol=2e-5, rtol=2e-4)
+        del output_replay, output_final
+        if getattr(args, "output_api", None):
+            current_replay, current_final = output_current_api()
+            for row, (replay, final) in enumerate(expected):
+                torch.testing.assert_close(current_replay[row], replay, atol=2e-5, rtol=2e-4)
+                torch.testing.assert_close(current_final[row], final, atol=2e-5, rtol=2e-4)
+            del current_replay, current_final
+
+    if getattr(args, "indexed_launch", None):
+        indexed_replay, indexed_final = indexed_baseline()
+        for row, (replay, final) in enumerate(expected):
+            torch.testing.assert_close(indexed_replay[row], replay, atol=2e-5, rtol=2e-4)
+            torch.testing.assert_close(indexed_final[row], final, atol=2e-5, rtol=2e-4)
+        del indexed_replay, indexed_final
 
     if getattr(args, "native_launch", None):
         native_replay, native_final = native_baseline()
@@ -181,9 +213,9 @@ def run_case(args, batch_size, segments, case):
     for row, (replay, final) in enumerate(expected):
         torch.testing.assert_close(actual_replay[row], replay, atol=2e-5, rtol=2e-4)
         torch.testing.assert_close(actual_final[row], final, atol=2e-5, rtol=2e-4)
-        max_abs = max(
-            max_abs, (actual_final[row] - final).abs().max().item(), (actual_replay[row] - replay).abs().max().item()
-        )
+        max_abs = max(max_abs, (actual_final[row] - final).abs().max().item())
+        if replay.numel():
+            max_abs = max(max_abs, (actual_replay[row] - replay).abs().max().item())
     functions = {"torch": reference, "after": fused}
     if args.before_root:
         functions["before"] = before
@@ -191,6 +223,12 @@ def run_case(args, batch_size, segments, case):
         functions["packed"] = packed_baseline
     if getattr(args, "native_launch", None):
         functions["native"] = native_baseline
+    if getattr(args, "indexed_launch", None):
+        functions["indexed"] = indexed_baseline
+    if getattr(args, "output_launch", None):
+        functions["output"] = output_baseline
+        if getattr(args, "output_api", None):
+            functions["output_current_api"] = output_current_api
     for _ in range(3):
         for fn in functions.values():
             fn()
@@ -201,6 +239,8 @@ def run_case(args, batch_size, segments, case):
     before_peak = peak_workspace(before) if args.before_root else None
     packed_peak = peak_workspace(packed_baseline) if getattr(args, "packed_launch", None) else None
     native_peak = peak_workspace(native_baseline) if getattr(args, "native_launch", None) else None
+    indexed_peak = peak_workspace(indexed_baseline) if getattr(args, "indexed_launch", None) else None
+    output_peak = peak_workspace(output_baseline) if getattr(args, "output_launch", None) else None
     torch.testing.assert_close(zero_pool, saved_pools[0], rtol=0, atol=0)
     torch.testing.assert_close(transition_pool, saved_pools[1], rtol=0, atol=0)
     # Recheck after repeated launches; metadata owners must remain stream-safe.
@@ -214,6 +254,7 @@ def run_case(args, batch_size, segments, case):
                 "status": "PASS",
                 "mode": args.mode,
                 "case": case,
+                "cache_only": args.cache_only,
                 "batch_size": batch_size,
                 "segments": segments,
                 "heads": heads,
@@ -227,6 +268,11 @@ def run_case(args, batch_size, segments, case):
                 "before_ms": timings.get("before"),
                 "packed_ms": timings.get("packed"),
                 "native_ms": timings.get("native"),
+                "indexed_ms": timings.get("indexed"),
+                "output_ms": timings.get("output"),
+                "output_current_api_ms": timings.get("output_current_api"),
+                "output_workspace_bytes": output_peak,
+                "indexed_workspace_bytes": indexed_peak,
                 "native_workspace_bytes": native_peak,
                 "packed_workspace_bytes": packed_peak,
                 "before_workspace_bytes": before_peak,
@@ -251,8 +297,11 @@ def main():
     parser.add_argument("--iterations", type=int, default=20)
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--seed", type=int, default=20260924)
+    parser.add_argument("--cache-only", action="store_true", help="All S/T from cache; no fresh Query summary/replay")
     parser.add_argument("--before-root", type=Path, help="Previous checkout for same-input before/after timing")
     args = parser.parse_args()
+    if args.cache_only and args.cases != ["warm"]:
+        parser.error("--cache-only requires --cases warm")
     if min(*args.batch_sizes, *args.segments, args.heads, args.dim, args.iterations, args.repeats) <= 0:
         parser.error("sizes, iterations and repeats must be positive")
     if args.dim > 128:

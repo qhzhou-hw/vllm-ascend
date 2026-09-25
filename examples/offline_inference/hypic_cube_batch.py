@@ -1,7 +1,9 @@
 """Experimental batched FP32 Cube composition; invoked by hypic_compose_cube.
 
-One Cube chain and one output scatter. Indexed mode reads original S/T tensors
-through a pointer packet and uses each request's actual length; no S/T packing.
+Indexed mode reads original S/T tensors through a pointer packet and uses each
+request's actual length; no S/T packing. Output mode additionally writes replay
+and final directly, without a history tensor or a separate scatter kernel.
+Cached mode specializes empty fresh/replay inputs to compact pool-slot metadata.
 Older packed controls use left identity padding and CANN or diagnostic gathers.
 Not registered as a production backend; all allocation/metadata work is timed.
 """
@@ -76,6 +78,82 @@ def _indexed_chain(packet, history, H: tl.constexpr, N: tl.constexpr, B: tl.cons
         transition = tl.load(t + offsets)
         state = tl.dot(state, transition, input_precision="ieee") + zero
         tl.store(output + ((step + 1) % HISTORY) * size, state)
+
+
+@triton.jit
+def _cached_chain(zero_pool, transition_pool, packet, final, H: tl.constexpr, N: tl.constexpr):
+    """Cache-only chain: direct pool arguments and slot ids, no fresh/replay."""
+    row = tl.program_id(0)
+    head = tl.program_id(1)
+    metadata = packet + row * (N + 2)
+    request = tl.load(metadata).to(tl.int64)
+    count = tl.load(metadata + 1).to(tl.int32)
+    keys = tl.arange(0, 128)
+    offsets = head * 128 * 128 + keys[:, None] * 128 + keys[None, :]
+    size: tl.constexpr = H * 128 * 128
+    slot = tl.load(metadata + 2).to(tl.int64)
+    state = tl.load(zero_pool + slot * size + offsets)
+    for step in range(1, count):
+        slot = tl.load(metadata + 2 + step).to(tl.int64)
+        zero = tl.load(zero_pool + slot * size + offsets)
+        transition = tl.load(transition_pool + slot * size + offsets)
+        state = tl.dot(state, transition, input_precision="ieee") + zero
+    tl.store(final + request * size + offsets, state)
+
+
+def _cache_only_compose(zero_states, zero_pool, transition_pool, steps):
+    """Called only after all sources are cached and all fresh/replay units absent."""
+    batch = len(steps)
+    heads = zero_pool.shape[1]
+    active = [(row, sequence) for row, sequence in enumerate(steps) if sequence]
+    shape = (batch, heads, 128, 128)
+    allocate = torch.empty if len(active) == batch else torch.zeros
+    final = allocate(shape, device=zero_pool.device, dtype=zero_pool.dtype)
+    replay = [torch.empty_like(s) for s in zero_states]
+    if not active:
+        return replay, final
+    count = max(len(sequence) for _, sequence in active)
+    if max(batch, count, zero_pool.shape[0]) >= 2**31:
+        raise ValueError("cache-only metadata exceeds int32 capacity")
+    values = []
+    for row, sequence in active:
+        values.extend((row, len(sequence)))
+        values.extend(-step.source - 1 for step in sequence)
+        values.extend([0] * (count - len(sequence)))
+    packet = torch.tensor(values, dtype=torch.int32, device=zero_pool.device)
+    _cached_chain[(len(active), heads)](
+        zero_pool, transition_pool, packet, final, heads, count, num_warps=4, enable_fp_fusion=False
+    )
+    return replay, final
+
+
+@triton.jit
+def _output_chain(packet, final, H: tl.constexpr, N: tl.constexpr, B: tl.constexpr):
+    """Store only requested incoming states and the final state; no history."""
+    request = tl.program_id(0)
+    head = tl.program_id(1)
+    keys = tl.arange(0, 128)
+    offsets = head * 128 * 128 + keys[:, None] * 128 + keys[None, :]
+    size: tl.constexpr = H * 128 * 128
+    metadata = packet + B * 4 + request * N * 3
+    count = tl.load(packet + request * 4 + 3).to(tl.int32)
+    address = tl.load(metadata + 2)
+    if address != 0:
+        destination = address.to(tl.pointer_type(tl.float32))
+        tl.store(destination + offsets, tl.full((128, 128), 0, tl.float32))
+    s = tl.load(metadata).to(tl.pointer_type(tl.float32))
+    state = tl.load(s + offsets)
+    for step in range(1, count):
+        address = tl.load(metadata + step * 3 + 2)
+        if address != 0:
+            destination = address.to(tl.pointer_type(tl.float32))
+            tl.store(destination + offsets, state)
+        s = tl.load(metadata + step * 3).to(tl.pointer_type(tl.float32))
+        t = tl.load(metadata + step * 3 + 1).to(tl.pointer_type(tl.float32))
+        zero = tl.load(s + offsets)
+        transition = tl.load(t + offsets)
+        state = tl.dot(state, transition, input_precision="ieee") + zero
+    tl.store(final + request * size + offsets, state)
 
 
 @triton.jit
@@ -161,14 +239,23 @@ def batch_compose(zero_states, transitions, zero_pool, transition_pool, steps, r
     _, heads, value_dim, key_dim = first.shape
     if (value_dim, key_dim, rows) != (128, 128, 128):
         raise ValueError("the batched Cube experiment requires K=V=rows=128")
+    if pack_mode == "cached":
+        if all(s.shape[0] == 0 for s in zero_states) and all(
+            step.source < 0 and step.replay == -1 for sequence in steps for step in sequence
+        ):
+            return _cache_only_compose(zero_states, zero_pool, transition_pool, steps)
+        # Mixed/fresh/replay plans keep the validated general path. Never treat
+        # a miss as a hit or omit requested replay to force the specialization.
+        return batch_compose(zero_states, transitions, zero_pool, transition_pool, steps, rows, pack_mode="output")
     batch = len(steps)
+    indexed = pack_mode in ("indexed", "output")
     count = max(1, max(map(len, steps)))
     history_count = count + 1 if any(step.replay >= 0 for sequence in steps for step in sequence[:-1]) else 2
     # Only elide zeroing when every output unit is overwritten by a replay.
     # Untargeted units (including block-native fresh Documents) remain zero.
     replay = [
         torch.empty_like(s)
-        if pack_mode == "indexed" and {step.replay for step in sequence if step.replay >= 0} == set(range(len(s)))
+        if indexed and {step.replay for step in sequence if step.replay >= 0} == set(range(len(s)))
         else torch.zeros_like(s)
         for s, sequence in zip(zero_states, steps)
     ]
@@ -182,22 +269,32 @@ def batch_compose(zero_states, transitions, zero_pool, transition_pool, steps, r
     state_bytes = heads * 128 * 128 * 4
     pool_s_base, pool_t_base = zero_pool.data_ptr(), transition_pool.data_ptr()
     empty_address = 0
-    if pack_mode == "indexed" and any(not sequence for sequence in steps):
+    if indexed and any(not sequence for sequence in steps):
         empty_state = torch.zeros((heads, 128, 128), device=first.device, dtype=first.dtype)
         empty_address = empty_state.data_ptr()
-    for zeros, transforms, sequence in zip(zero_states, transitions, steps):
-        if pack_mode != "indexed":
+    for row, (zeros, transforms, sequence) in enumerate(zip(zero_states, transitions, steps)):
+        if not indexed:
             metadata.extend([0, 0, -1] * (count - len(sequence)))
         fresh_s_base, fresh_t_base = zeros.data_ptr(), transforms.data_ptr()
+        if pack_mode == "output":
+            replay_base = replay[row].data_ptr()
         for step in sequence:
             if step.source < 0:
                 s_base, t_base, index = pool_s_base, pool_t_base, -step.source - 1
             else:
                 s_base, t_base, index = fresh_s_base, fresh_t_base, step.source
-            metadata.extend((s_base + index * state_bytes, t_base + index * state_bytes, step.replay))
-        if pack_mode == "indexed":
-            metadata.extend([empty_address, 0, -1] * (count - len(sequence)))
+            target = step.replay
+            if pack_mode == "output":
+                # A null destination means no replay write, not a valid slot.
+                target = replay_base + target * state_bytes if target >= 0 else 0
+            metadata.extend((s_base + index * state_bytes, t_base + index * state_bytes, target))
+        if indexed:
+            unused_target = 0 if pack_mode == "output" else -1
+            metadata.extend([empty_address, 0, unused_target] * (count - len(sequence)))
     packet = torch.tensor(headers + metadata, device=first.device, dtype=torch.int64)
+    if pack_mode == "output":
+        _output_chain[(batch, heads)](packet, final, heads, count, batch, num_warps=4, enable_fp_fusion=False)
+        return replay, final
     if pack_mode == "indexed":
         pass
     elif pack_mode == "native":

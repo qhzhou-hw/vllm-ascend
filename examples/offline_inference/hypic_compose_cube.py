@@ -286,13 +286,16 @@ def main():
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument(
         "--cube-variant",
-        choices=["persistent", "step", "direct", "packed", "batch", "window", "native", "indexed"],
+        choices=["persistent", "step", "direct", "packed", "batch", "window", "native", "indexed", "output", "cached"],
         default="persistent",
     )
     parser.add_argument("--cube-rows", type=int, choices=[16, 32, 64, 128], default=16)
     parser.add_argument("--cube-target", choices=["compose", "mock"], default="compose")
     parser.add_argument("--cube-window", type=int, default=16)
     parser.add_argument("--cube-baseline-module", help="Importable frozen native Cube module for same-process A/B")
+    parser.add_argument("--cube-indexed-baseline-module", help="Frozen indexed Cube module for same-process A/B")
+    parser.add_argument("--cube-output-baseline-module", help="Frozen output Cube module for same-process A/B")
+    parser.add_argument("--cube-output-api-module", help="Optional frozen validation API for the output baseline")
     args, remaining = parser.parse_known_args()
     if args.cube_target == "mock":
         import hypic_mock_validate as bench
@@ -304,7 +307,14 @@ def main():
         import hypic_compose_bench as bench
 
     original_bootstrap = bench.bootstrap
-    if args.cube_target == "compose" and args.cube_variant in ("batch", "window", "native", "indexed"):
+    if args.cube_target == "compose" and args.cube_variant in (
+        "batch",
+        "window",
+        "native",
+        "indexed",
+        "output",
+        "cached",
+    ):
         from functools import partial
 
         original_run_case = bench.run_case
@@ -316,6 +326,18 @@ def main():
 
                 baseline = importlib.import_module(args.cube_baseline_module)
                 case_args.native_launch = partial(baseline.batch_compose, rows=128, pack_mode="native")
+            if args.cube_indexed_baseline_module:
+                import importlib
+
+                baseline = importlib.import_module(args.cube_indexed_baseline_module)
+                case_args.indexed_launch = partial(baseline.batch_compose, rows=128, pack_mode="indexed")
+            if args.cube_output_baseline_module:
+                import importlib
+
+                baseline = importlib.import_module(args.cube_output_baseline_module)
+                case_args.output_launch = partial(baseline.batch_compose, rows=128, pack_mode="output")
+                if args.cube_output_api_module:
+                    case_args.output_api = importlib.import_module(args.cube_output_api_module).compose_fused_batch
             return original_run_case(case_args, *case_values)
 
         bench.run_case = run_case
@@ -324,15 +346,15 @@ def main():
         original_bootstrap(*bootstrap_args)
         from vllm_ascend.hypic import compose_triton
 
-        if args.cube_variant in ("direct", "packed", "batch", "window", "native", "indexed"):
+        if args.cube_variant in ("direct", "packed", "batch", "window", "native", "indexed", "output", "cached"):
             from functools import partial
 
             candidate = direct_compose if args.cube_variant == "direct" else packed_compose
-            if args.cube_variant in ("batch", "native", "indexed"):
+            if args.cube_variant in ("batch", "native", "indexed", "output", "cached"):
                 from hypic_cube_batch import batch_compose
 
                 candidate = batch_compose
-                if args.cube_variant in ("native", "indexed"):
+                if args.cube_variant in ("native", "indexed", "output", "cached"):
                     candidate = partial(batch_compose, pack_mode=args.cube_variant)
             if args.cube_variant == "window":
                 from hypic_cube_batch import window_compose
