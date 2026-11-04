@@ -1040,3 +1040,30 @@ segment 顺序及部分请求实际长度，结果仍正确。它不验证空请
 NPU event span 也含 Host dispatch 间隙，不能将其称为纯 Cube 执行时间。
 后续值得继续验证的是有明确所有者与容量上限的 metadata/workspace 复用；
 不能跳过 ready/generation/pin 校验或持久保存可能已失效的裸 slot 地址。
+
+## 13. Ascend C cached-only 实现
+
+新增独立的 Ascend C Cube/Vector 混合算子，读取已有缓存 S/T 并仅输出最终状态。
+实现范围、独立编译方式、704 项 NPU mock 回归和同输入延迟见
+[Ascend C cached-only 状态组合](hypic_cached_compose_ascendc_zh.md)。
+第二轮加入自动行块选择、独立 GM scratch 和异步工作区生命周期修复。
+8 heads、BS=4、64 段的同输入对照中，完整调用从 0.8254 ms 降至 0.4998 ms，
+prepared 从 0.7076 ms 降至 0.3802 ms；这些不是模型 TTFT 或纯 kernel 时间。
+该入口尚未替换生产后端，也并非所有形状都快于 Triton Cube。
+
+第三轮增加保持相邻段顺序的完整树形，以及只归并前几层、再顺序组合的混合方案。
+实测在 head 数少、小 batch、长链时有收益；8 heads、BS=4 时额外 T 乘法使其变慢。
+这是显式实验入口，数值等价允许 FP32 重关联误差，不宣称逐 bit 一致。
+
+第四轮增加 `single_kernel=True`：完整树形只启动一个 kernel，层间由全部 AIV 同步，
+AIC 持续服务 Matmul，并使用 batch 调度保证多流并发下同步安全。
+8 heads、BS=1、64 段复测中，prepared 从分层树形的 0.2218 ms 降至 0.1642 ms，
+完整调用从 0.3217 ms 降至 0.2222 ms。中间 GM 缓冲仍然存在，BS=4 时仍慢于顺序版。
+
+第五轮支持 `single_kernel=True, merge_levels=1/2/3`，把树形和保留 UB 状态的顺序尾段融合成一次启动。
+704 项 NPU 回归通过。主轮中，8 heads、BS=4 的一层混合比单 kernel 完整树形快约 14%–24%，
+但仍慢于顺序；prepared 口径中 BS=1 和 head 较少时，完整树形更快。一层混合可减少中间缓冲，
+64 段、8 heads、BS=4 的额外活跃分配从约 208 MiB 降到 148 MiB。
+独立种子复测维持该结论，profiler 确认三个混合深度均为一次 device kernel 启动。
+每次重建元数据的完整调用存在不同取舍：1 head、BS=4、256 段时，一层混合为 0.8748 ms，
+完整树形为 0.9825 ms；但 prepared 分别为 0.5894 / 0.2887 ms，不能把完整调用收益等同于 kernel 加速。
